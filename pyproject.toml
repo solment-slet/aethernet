@@ -15,7 +15,7 @@ dependencies = [
     "msgpack>=1.1.2,<2"
 ]
 
-[dependency-groups]
+[project.optional-dependencies]
 server = [
     "httpx>=0.28.1,<0.29",
     "websockets>=16.0,<16.1"
