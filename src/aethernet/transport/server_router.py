@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 import websockets
 
-from transport import AggregatingLink
+from aethernet.transport import AggregatingLink
 
 
 def _encode_json_bytes(obj: dict[str, Any]) -> bytes:
@@ -18,7 +18,7 @@ def _decode_json_bytes(data: bytes) -> dict[str, Any]:
     return json.loads(data.decode("utf-8"))
 
 
-class MachineBRouter:
+class ServerRouter:
     def __init__(
         self,
         link: AggregatingLink,
@@ -184,7 +184,7 @@ class MachineBRouter:
             print(f"B: WS connecting upstream stream={stream_id}")
             async with websockets.connect(
                 url,
-                # возможно тут надо extra_headers, см. ниже
+                # Возможно тут надо extra_headers, см. ниже
                 additional_headers=headers or None,
                 subprotocols=subprotocols or None,
             ) as ws:

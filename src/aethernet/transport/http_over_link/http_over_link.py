@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from transport import AggregatingLink
+from aethernet.transport import AggregatingLink
 
 # =========================
 # Общие сериализаторы
@@ -139,7 +139,7 @@ class LinkResponseByteStream(httpx.AsyncByteStream):
 # =========================
 
 
-class LinkHTTPTransport(httpx.AsyncBaseTransport):
+class AethernetHttpTransport(httpx.AsyncBaseTransport):
     def __init__(self, link: AggregatingLink):
         self._link = link
 

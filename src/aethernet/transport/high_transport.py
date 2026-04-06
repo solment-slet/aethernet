@@ -5,13 +5,14 @@ import math
 import struct
 import time
 import uuid
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import msgpack
 
-from logger import logger
-from transport.medium_transport import Transport
+from aethernet.typing import LoggerLike
+from aethernet.transport.medium_transport import MediumTransport
 
 
 @dataclass(slots=True)
@@ -99,8 +100,9 @@ class AggregatingLink:
 
     def __init__(
         self,
-        transport: Transport,
+        transport: MediumTransport,
         *,
+        logger: LoggerLike = logging.getLogger(__name__),
         flush_interval: float = 0.5,
         min_send_interval: float = 0.25,
         max_batch_size: int = 64 * 1024,
@@ -116,6 +118,7 @@ class AggregatingLink:
             recv_restart_delay: Пауза между итерациями recv loop.
             chunk_assembly_ttl: Время жизни незавершённой сборки chunk-пакетов.
         """
+        self._logger = logger
         self._transport = transport
 
         self._flush_interval = flush_interval
@@ -173,7 +176,7 @@ class AggregatingLink:
         # Важно для сохранения строгого порядка без возврата в конец очереди.
         self._pending_outgoing: Frame | None = None
 
-        # Буферы для сборки chunk-пакетов.
+        # Буфера для сборки chunk-пакетов.
         self._chunk_assemblies: dict[bytes, _ChunkAssembly] = {}
 
         # Reader/writer tasks.
@@ -189,7 +192,7 @@ class AggregatingLink:
         # Timestamp последнего physical send().
         self._last_send_ts = 0.0
 
-        logger.info(
+        self._logger.info(
             "AggregatingLink initialized: transport_limit={}, single_limit={}, chunk_limit={}, max_batch_size={}",
             self._transport_limit,
             self._single_packet_payload_limit,
@@ -221,7 +224,7 @@ class AggregatingLink:
                 self._writer_loop(), name="AggregatingLink.writer"
             )
 
-            logger.info("AggregatingLink started")
+            self._logger.info("AggregatingLink started")
 
     async def close(self) -> None:
         """
@@ -249,7 +252,7 @@ class AggregatingLink:
                 Frame(stream_id="__control__", frame_type="__closed__", end=True)
             )
 
-        logger.info("AggregatingLink closed")
+        self._logger.info("AggregatingLink closed")
 
     async def accept_stream(self) -> str:
         """
@@ -261,15 +264,6 @@ class AggregatingLink:
         if not self._started:
             raise RuntimeError("AggregatingLink.start() must be called first")
         return await self._new_stream_notifications.get()
-
-    def new_stream_id(self) -> str:
-        """
-        Генерирует новый уникальный stream_id.
-
-        Returns:
-            Строковый hex-идентификатор.
-        """
-        return uuid.uuid4().hex
 
     async def send_frame(
         self,
@@ -346,6 +340,16 @@ class AggregatingLink:
             if frame.end:
                 return
 
+    @staticmethod
+    def new_stream_id() -> str:
+        """
+        Генерирует новый уникальный stream_id.
+
+        Returns:
+            Строковый hex-идентификатор.
+        """
+        return uuid.uuid4().hex
+
     async def _reader_loop(self) -> None:
         """
         Постоянно читает physical packets из transport, при необходимости
@@ -357,7 +361,7 @@ class AggregatingLink:
                 try:
                     raw_packet = await asyncio.to_thread(self._transport.recv)
 
-                    logger.debug(
+                    self._logger.debug(
                         "AggregatingLink recv physical packet: size={}, prefix={}",
                         len(raw_packet),
                         raw_packet[:32].hex(),
@@ -367,14 +371,14 @@ class AggregatingLink:
                     raise
 
                 except Exception:
-                    logger.exception("Ошибка транспорта recv, продолжаем работу.")
+                    self._logger.exception("Ошибка транспорта recv, продолжаем работу.")
                     await asyncio.sleep(0.2)
                     continue
 
                 try:
                     logical_payloads = self._decode_transport_packet(raw_packet)
                 except Exception as e:
-                    logger.error("Получен битый transport packet: {}", e)
+                    self._logger.error("Получен битый transport packet: {}", e)
                     continue
 
                 # Чистим подвисшие незавершенные chunk-сборки.
@@ -384,10 +388,10 @@ class AggregatingLink:
                     try:
                         frames = self._decode_batch(logical_payload)
                     except Exception as e:
-                        logger.error("Получен битый logical batch: {}", e)
+                        self._logger.error("Получен битый logical batch: {}", e)
                         continue
 
-                    logger.debug(
+                    self._logger.debug(
                         "Decoded logical batch: frames={}, payload_size={}",
                         len(frames),
                         len(logical_payload),
@@ -411,7 +415,7 @@ class AggregatingLink:
                     await asyncio.sleep(self._recv_restart_delay)
 
         except asyncio.CancelledError:
-            logger.debug("AggregatingLink reader loop cancelled")
+            self._logger.debug("AggregatingLink reader loop cancelled")
             raise
 
     async def _writer_loop(self) -> None:
@@ -463,7 +467,7 @@ class AggregatingLink:
                 logical_payload = self._encode_batch(batch)
                 transport_packets = self._encode_transport_packets(logical_payload)
 
-                logger.debug(
+                self._logger.debug(
                     "Prepared batch: frames={}, est_size={}, logical_payload_size={}, transport_packets={}",
                     len(batch),
                     batch_size_estimate,
@@ -472,7 +476,7 @@ class AggregatingLink:
                 )
 
                 if len(transport_packets) > 1:
-                    logger.warning(
+                    self._logger.warning(
                         "Logical payload split into {} transport packets (payload_size={}, transport_limit={})",
                         len(transport_packets),
                         len(logical_payload),
@@ -481,7 +485,7 @@ class AggregatingLink:
 
                 try:
                     for packet_index, packet in enumerate(transport_packets):
-                        logger.debug(
+                        self._logger.debug(
                             "Sending physical packet {}/{}: size={}, prefix={}",
                             packet_index + 1,
                             len(transport_packets),
@@ -494,11 +498,11 @@ class AggregatingLink:
                     raise
 
                 except Exception:
-                    logger.exception("Ошибка при отправке сообщения")
+                    self._logger.exception("Ошибка при отправке сообщения")
                     await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
-            logger.debug("AggregatingLink writer loop cancelled")
+            self._logger.debug("AggregatingLink writer loop cancelled")
             raise
 
     async def _send_physical_packet(self, packet: bytes) -> None:
@@ -512,7 +516,7 @@ class AggregatingLink:
         wait_more = self._min_send_interval - (now - self._last_send_ts)
 
         if wait_more > 0:
-            logger.debug("Waiting {:.3f}s before next physical send", wait_more)
+            self._logger.debug("Waiting {:.3f}s before next physical send", wait_more)
             await asyncio.sleep(wait_more)
 
         await asyncio.to_thread(self._transport.send, packet)
@@ -596,7 +600,7 @@ class AggregatingLink:
                     created_at=time.monotonic(),
                 )
                 self._chunk_assemblies[msg_id] = assembly
-                logger.debug(
+                self._logger.debug(
                     "Created chunk assembly: msg_id={}, total_parts={}",
                     msg_id.hex(),
                     total_parts,
@@ -607,7 +611,7 @@ class AggregatingLink:
 
             assembly.parts[part_index] = chunk_data
 
-            logger.debug(
+            self._logger.debug(
                 "Received chunk: msg_id={}, part={}/{}, chunk_size={}, received_parts={}",
                 msg_id.hex(),
                 part_index + 1,
@@ -622,7 +626,7 @@ class AggregatingLink:
                 )
                 del self._chunk_assemblies[msg_id]
 
-                logger.debug(
+                self._logger.debug(
                     "Chunk assembly complete: msg_id={}, payload_size={}",
                     msg_id.hex(),
                     len(payload),
@@ -648,7 +652,7 @@ class AggregatingLink:
         ]
 
         for msg_id in stale_ids:
-            logger.warning("Dropping stale chunk assembly: msg_id={}", msg_id.hex())
+            self._logger.warning("Dropping stale chunk assembly: msg_id={}", msg_id.hex())
             del self._chunk_assemblies[msg_id]
 
     @staticmethod

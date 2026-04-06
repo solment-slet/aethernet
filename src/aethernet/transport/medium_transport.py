@@ -1,25 +1,28 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import Annotated, TYPE_CHECKING
 import os
+import logging
 
 import basex
 from Crypto.Cipher import ChaCha20_Poly1305
 
-from logger import logger
-from config import Config
+from aethernet.typing import LoggerLike
 
 if TYPE_CHECKING:
-    from transport import LowTransport
+    from aethernet.transport import LowTransport
+    Bytes32 = Annotated[bytes, 32]
 
 
-class Transport:
+class MediumTransport:
     def __init__(
         self,
-        config: Config,
         transport: LowTransport,
+        encryption_key: Bytes32,
+        logger: LoggerLike = logging.getLogger(__name__),
     ) -> None:
-        self.cfg = config
-        self._basex = basex.init(alphabet=Transport.make_alphabet())
+        self._logger = logger
+        self._encryption_key = encryption_key
+        self._basex = basex.init(alphabet=MediumTransport.make_alphabet())
         self.max_message_chars = 4096
         self.max_payload_bytes = self._calc_max_payload_bytes()
         self.low_transport = transport
@@ -28,7 +31,7 @@ class Transport:
 
     def send(self, data: bytes) -> None:
         self.low_transport.send_message(self._encode(data))
-        logger.info("Отправлено сообщение!")
+        self._logger.debug("Отправлено сообщение")
 
     def recv(self) -> bytes:
         while True:
@@ -37,13 +40,13 @@ class Transport:
                 if text is not None:
                     break
             except Exception:
-                logger.exception("Ошибка при получении сообщения от `low_transport`")
+                self._logger.exception("Ошибка при получении сообщения от `low_transport`")
 
         return self._decode(text)
 
     def _encode(self, data: bytes) -> str:
         nonce = os.urandom(12)
-        cipher = ChaCha20_Poly1305.new(key=self.cfg.encryption_key, nonce=nonce)
+        cipher = ChaCha20_Poly1305.new(key=self._encryption_key, nonce=nonce)
         ciphertext, tag = cipher.encrypt_and_digest(data)
         payload = nonce + tag + ciphertext
         return self._basex.encode(payload)
@@ -54,7 +57,7 @@ class Transport:
         tag = payload[12:28]
         ciphertext = payload[28:]
 
-        cipher = ChaCha20_Poly1305.new(key=self.cfg.encryption_key, nonce=nonce)
+        cipher = ChaCha20_Poly1305.new(key=self._encryption_key, nonce=nonce)
         return cipher.decrypt_and_verify(ciphertext, tag)
 
     def _calc_max_payload_bytes(self) -> int:

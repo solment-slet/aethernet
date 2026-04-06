@@ -1,3 +1,3 @@
-from transport.high_transport import AggregatingLink, Frame
-from transport.medium_transport import Transport
-from transport.low_transport import LowTransport
+from aethernet.transport.high_transport import AggregatingLink, Frame
+from aethernet.transport.medium_transport import MediumTransport
+from aethernet.transport.low_transport import LowTransport

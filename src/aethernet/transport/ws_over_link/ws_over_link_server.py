@@ -6,7 +6,7 @@ from typing import Any
 
 import websockets
 
-from transport import AggregatingLink
+from aethernet.transport import AggregatingLink
 
 
 def _encode_json_bytes(obj: dict[str, Any]) -> bytes:

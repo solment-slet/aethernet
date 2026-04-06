@@ -4,23 +4,18 @@ import time
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
 
-from config import Config
-
-# ─── VK API helpers ───────────────────────────────────────────────────
-
 
 class LowTransport:
     """Отправка/получение сообщений через VK API."""
 
     def __init__(
         self,
-        config: Config,
-        token: str,
-        receiver_id: int,
+        vk_api_version: str,
+        vk_token: str,
+        vk_receiver_id: int,
     ) -> None:
-        self.cfg = config
-        self.receiver_id = receiver_id
-        self._session = vk_api.VkApi(token=token, api_version=self.cfg.vk_api_version)
+        self.receiver_id = vk_receiver_id
+        self._session = vk_api.VkApi(token=vk_token, api_version=vk_api_version)
         self._api = self._session.get_api()
 
     def send_message(self, text: str) -> None:

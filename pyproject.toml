@@ -9,10 +9,21 @@ readme = "README.md"
 requires-python = ">=3.12, <3.14"
 dependencies = [
     "basex-python==0.1.0",
-    "httpx==0.28.1",
-    "loguru==0.7.3",
+    "msgpack>=1.1.2",
+    "pycryptodome>=3.23.0,<4",
     "vk-api==11.10.0",
-    "websockets==16.0",
+    "msgpack>=1.1.2,<2"
+]
+
+[dependency-groups]
+server = [
+    "httpx>=0.28.1,<0.29",
+    "websockets>=16.0,<16.1"
+]
+
+dev = [
+    "langchain-openai",
+    "loguru",
 ]
 
 [build-system]
