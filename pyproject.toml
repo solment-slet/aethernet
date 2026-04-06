@@ -1,0 +1,20 @@
+[project]
+name = "aethernet"
+version = "0.1.0"
+description = "Part of Slet Infrastructure"
+authors = [
+    { name = "Walter Kerrigan", email = "esolment@gmail.com" },
+]
+readme = "README.md"
+requires-python = ">=3.12, <3.14"
+dependencies = [
+    "basex-python==0.1.0",
+    "httpx==0.28.1",
+    "loguru==0.7.3",
+    "vk-api==11.10.0",
+    "websockets==16.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
