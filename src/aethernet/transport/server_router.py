@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+import logging
 
 import httpx
 import websockets
 
 from aethernet.transport import AggregatingLink
+from aethernet.typing import LoggerLike
 
 
 def _encode_json_bytes(obj: dict[str, Any]) -> bytes:
@@ -24,13 +26,17 @@ class ServerRouter:
         link: AggregatingLink,
         *,
         http_client: httpx.AsyncClient | None = None,
+        proxy_http_client: httpx.AsyncClient | None = None,
         sse_flush_bytes: int = 32 * 1024,
         sse_flush_interval: float = 0.5,
+        logger: LoggerLike = logging.getLogger(__name__),
     ) -> None:
         self._link = link
         self._http_client = http_client or httpx.AsyncClient(timeout=None)
+        self._proxy_http_client = proxy_http_client or httpx.AsyncClient(timeout=None)
         self._sse_flush_bytes = sse_flush_bytes
         self._sse_flush_interval = sse_flush_interval
+        self._logger = logger
         self._task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -88,7 +94,21 @@ class ServerRouter:
         print("Выполняется _handle_http")
         method = first_meta["method"]
         url = first_meta["url"]
-        headers = [tuple(x) for x in first_meta.get("headers", [])]
+        headers: list[tuple[str, str]] = [
+            (str(k), str(v)) for k, v in first_meta.get("headers", [])
+        ]
+
+        use_proxy = False
+        new_headers = []
+
+        for k, v in headers:
+            if k.lower() == "slet-aethernet-use-proxy":
+                use_proxy = True
+                continue
+            new_headers.append((k, v))
+
+        headers = new_headers
+        http_proxy = self._proxy_http_client if use_proxy else self._http_client
 
         body_parts: list[bytes] = []
 
@@ -112,7 +132,7 @@ class ServerRouter:
 
         body = b"".join(body_parts)
 
-        req = self._http_client.build_request(
+        req = http_proxy.build_request(
             method=method,
             url=url,
             headers=headers,
@@ -120,7 +140,7 @@ class ServerRouter:
         )
 
         print("Готовимся к отправке сообщения")
-        resp = await self._http_client.send(req, stream=True)
+        resp = await http_proxy.send(req, stream=True)
         print("Получили ответ!")
 
         content_type = resp.headers.get("content-type", "")

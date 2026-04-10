@@ -140,18 +140,41 @@ class LinkResponseByteStream(httpx.AsyncByteStream):
 
 
 class AethernetHttpTransport(httpx.AsyncBaseTransport):
-    def __init__(self, link: AggregatingLink):
+    """
+    Клиентский HTTP transport для машины A.
+
+    Преобразует httpx.Request в link-протокол и получает ответ через link.
+
+    Args:
+        link: AggregatingLink для связи с машиной B.
+        use_proxy: Если True, добавляет заголовок Slet-Aethernet-Use-Proxy,
+                   чтобы сервер использовал proxy http client.
+    """
+    def __init__(
+        self,
+        link: AggregatingLink,
+        *,
+        use_proxy: bool = True,
+    ) -> None:
         self._link = link
+        self._use_proxy = use_proxy
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         stream_id = self._link.new_stream_id()
         body = await request.aread()
 
+        # Собираем заголовки
+        headers = _headers_to_list(request.headers)
+
+        # Если включен proxy режим — добавляем служебный заголовок
+        if self._use_proxy:
+            headers.append(("Slet-Aethernet-Use-Proxy", "1"))
+
         request_start = {
             "kind": "request_start",
             "method": request.method,
             "url": str(request.url),
-            "headers": _headers_to_list(request.headers),
+            "headers": headers,
             "has_body": bool(body),
         }
 
