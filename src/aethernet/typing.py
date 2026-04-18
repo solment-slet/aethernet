@@ -1,4 +1,4 @@
-from typing import Protocol
+from typing import Protocol, Annotated
 
 
 class LoggerLike(Protocol):
@@ -8,3 +8,6 @@ class LoggerLike(Protocol):
     def error(self, msg: str, *args, **kwargs) -> None: ...
     def exception(self, msg: str, *args, **kwargs) -> None: ...
     def critical(self, msg: str, *args, **kwargs) -> None: ...
+
+
+Bytes32 = Annotated[bytes, 32]

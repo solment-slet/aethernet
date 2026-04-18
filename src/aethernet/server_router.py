@@ -1,23 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import signal
 from typing import Any
 import logging
 
 import httpx
 import websockets
 
-from aethernet.transport import AggregatingLink
+from aethernet.transport import LowTransport, AggregatingLink, get_transport
 from aethernet.typing import LoggerLike
-
-
-def _encode_json_bytes(obj: dict[str, Any]) -> bytes:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-
-def _decode_json_bytes(data: bytes) -> dict[str, Any]:
-    return json.loads(data.decode("utf-8"))
+from aethernet.transport._utils import encode_json_bytes, decode_json_bytes
+from aethernet.typing import Bytes32
 
 
 class ServerRouter:
@@ -72,7 +66,7 @@ class ServerRouter:
                 )
                 return
 
-            meta = _decode_json_bytes(first.payload)
+            meta = decode_json_bytes(first.payload)
             kind = meta.get("kind")
             print(f"B: first meta kind={kind} stream={stream_id}")
 
@@ -124,7 +118,7 @@ class ServerRouter:
             if frame.frame_type != "meta":
                 continue
 
-            meta = _decode_json_bytes(frame.payload)
+            meta = decode_json_bytes(frame.payload)
             if meta.get("kind") == "request_end":
                 break
             if frame.end:
@@ -149,7 +143,7 @@ class ServerRouter:
         await self._link.send_frame(
             stream_id,
             "meta",
-            _encode_json_bytes(
+            encode_json_bytes(
                 {
                     "kind": "response_start",
                     "status_code": resp.status_code,
@@ -187,33 +181,36 @@ class ServerRouter:
             await self._link.send_frame(
                 stream_id,
                 "meta",
-                _encode_json_bytes({"kind": "response_end"}),
+                encode_json_bytes({"kind": "response_end"}),
                 end=True,
             )
         finally:
             await resp.aclose()
 
     async def _handle_ws(self, stream_id: str, first_meta: dict[str, Any]) -> None:
-        url = first_meta["url"]
-        headers = [tuple(x) for x in first_meta.get("headers", [])]
-        subprotocols = first_meta.get("subprotocols", [])
+        excluded = {"uri", "kind"}  # поля которые не идут в connect()
+        tuple_args = {"max_size", "max_queue", "write_limit"}
 
-        print(f"B: WS open stream={stream_id} url={url}")
+        uri = first_meta["uri"]
+        ws_kwargs = {
+            k: v for k, v in first_meta.items() if k not in excluded and v is not None
+        }
+
+        for key in tuple_args:
+            if key in ws_kwargs and isinstance(ws_kwargs[key], list):
+                ws_kwargs[key] = tuple(ws_kwargs[key])
+
+        self._logger.info(f"B: WS open stream={stream_id} url={uri}")
 
         try:
-            print(f"B: WS connecting upstream stream={stream_id}")
-            async with websockets.connect(
-                url,
-                # Возможно тут надо extra_headers, см. ниже
-                additional_headers=headers or None,
-                subprotocols=subprotocols or None,
-            ) as ws:
+            self._logger.debug(f"B: WS connecting upstream stream={stream_id}")
+            async with websockets.connect(uri, **ws_kwargs) as ws:
                 print(f"B: WS connected upstream stream={stream_id}")
 
                 await self._link.send_frame(
                     stream_id,
                     "meta",
-                    _encode_json_bytes(
+                    encode_json_bytes(
                         {
                             "kind": "ws_opened",
                             "subprotocol": ws.subprotocol,
@@ -253,7 +250,7 @@ class ServerRouter:
             await self._link.send_frame(
                 stream_id,
                 "meta",
-                _encode_json_bytes(
+                encode_json_bytes(
                     {
                         "kind": "ws_closed",
                         "code": getattr(ws, "close_code", None),
@@ -280,7 +277,7 @@ class ServerRouter:
             if frame.frame_type != "meta":
                 continue
 
-            meta = _decode_json_bytes(frame.payload)
+            meta = decode_json_bytes(frame.payload)
             kind = meta.get("kind")
 
             if kind == "ws_close":
@@ -297,6 +294,91 @@ class ServerRouter:
         await self._link.send_frame(
             stream_id,
             "meta",
-            _encode_json_bytes({"kind": "error", "message": message}),
+            encode_json_bytes({"kind": "error", "message": message}),
             end=True,
         )
+
+
+class AethernetServer(ServerRouter):
+    def __init__(
+        self,
+        transport: AggregatingLink,
+        *,
+        # Server Router
+        http_client: httpx.AsyncClient = httpx.AsyncClient(
+            timeout=None, trust_env=False
+        ),
+        proxy_http_client: httpx.AsyncClient = httpx.AsyncClient(timeout=None),
+        sse_flush_bytes: int = 65536,
+        sse_flush_interval: float = 0.5,
+        # Logging
+        logger: LoggerLike = logging.getLogger(),
+    ) -> None:
+        self.stop_event = asyncio.Event()
+
+        self.transport = transport
+
+        super().__init__(
+            self.transport,
+            http_client=http_client,
+            proxy_http_client=proxy_http_client,
+            sse_flush_bytes=sse_flush_bytes,
+            sse_flush_interval=sse_flush_interval,
+            logger=logger,
+        )
+
+    @classmethod
+    async def create(
+        cls,
+        low_transport: LowTransport,
+        *,
+        # Transport
+        encryption_key: Bytes32,
+        flush_interval: float = 0.5,
+        max_batch_size: int = 64 * 1024,
+        chunk_assembly_ttl: float = 60.0,
+        # Server Router
+        http_client: httpx.AsyncClient = httpx.AsyncClient(
+            timeout=None, trust_env=False
+        ),
+        proxy_http_client: httpx.AsyncClient = httpx.AsyncClient(timeout=None),
+        sse_flush_bytes: int = 65536,
+        sse_flush_interval: float = 0.5,
+        # Logging
+        logger: LoggerLike = logging.getLogger(),
+    ) -> AethernetServer:
+        transport = await get_transport(
+            low_transport,
+            encryption_key=encryption_key,
+            flush_interval=flush_interval,
+            max_batch_size=max_batch_size,
+            chunk_assembly_ttl=chunk_assembly_ttl,
+            logger=logger,
+        )
+
+        return cls(
+            transport,
+            http_client=http_client,
+            proxy_http_client=proxy_http_client,
+            sse_flush_bytes=sse_flush_bytes,
+            sse_flush_interval=sse_flush_interval,
+            logger=logger,
+        )
+
+    async def start_and_wait(self) -> None:
+        """Запуск сервера и ожидание завершения программы"""
+        await self.start()
+
+        event_loop = asyncio.get_event_loop()
+
+        event_loop.add_signal_handler(signal.SIGTERM, self.stop_event.set)  # type: ignore[arg-type]
+        event_loop.add_signal_handler(signal.SIGINT, self.stop_event.set)  # type: ignore[arg-type]
+
+        try:
+            await self.stop_event.wait()
+        finally:
+            await self.close()
+
+    async def close(self) -> None:
+        await super().close()
+        await self.transport.close()

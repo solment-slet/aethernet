@@ -1,8 +1,7 @@
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-*.pyd
 .Python
 
 # Сборка
@@ -11,6 +10,8 @@ dist/
 *.egg-info/
 *.egg
 MANIFEST
+pip-wheel-metadata/
+*.whl
 
 # Виртуальные окружения
 .venv/
@@ -24,14 +25,17 @@ uv.lock
 
 # Тесты и покрытие
 .pytest_cache/
-.coverage
-.coverage.*
+.coverage*
 htmlcov/
 .tox/
+.hypothesis/
 
 # Линтеры
 .mypy_cache/
 .ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
 
 # Редакторы
 .idea/

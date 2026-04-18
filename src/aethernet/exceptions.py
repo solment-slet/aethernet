@@ -1,0 +1,2 @@
+class TransportClosedError(RuntimeError):
+    pass

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass
-from typing import Any
 
 import httpx
 
 from aethernet.transport import AggregatingLink
+from aethernet.transport._utils import encode_json_bytes, decode_json_bytes
 
 # =========================
 # Общие сериализаторы
@@ -22,14 +21,6 @@ def _headers_to_list(
     if isinstance(headers, httpx.Headers):
         return list(headers.multi_items())
     return list(headers)
-
-
-def _encode_json_bytes(obj: dict[str, Any]) -> bytes:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-
-def _decode_json_bytes(data: bytes) -> dict[str, Any]:
-    return json.loads(data.decode("utf-8"))
 
 
 # =========================
@@ -115,7 +106,7 @@ class LinkResponseByteStream(httpx.AsyncByteStream):
             if frame.frame_type != "meta":
                 continue
 
-            meta = _decode_json_bytes(frame.payload)
+            meta = decode_json_bytes(frame.payload)
             kind = meta.get("kind")
 
             if kind == "response_end":
@@ -139,7 +130,7 @@ class LinkResponseByteStream(httpx.AsyncByteStream):
 # =========================
 
 
-class AethernetHttpTransport(httpx.AsyncBaseTransport):
+class AethernetHttpx(httpx.AsyncBaseTransport):
     """
     Клиентский HTTP transport для машины A.
 
@@ -150,11 +141,12 @@ class AethernetHttpTransport(httpx.AsyncBaseTransport):
         use_proxy: Если True, добавляет заголовок Slet-Aethernet-Use-Proxy,
                    чтобы сервер использовал proxy http client.
     """
+
     def __init__(
         self,
         link: AggregatingLink,
         *,
-        use_proxy: bool = True,
+        use_proxy: bool = False,
     ) -> None:
         self._link = link
         self._use_proxy = use_proxy
@@ -181,7 +173,7 @@ class AethernetHttpTransport(httpx.AsyncBaseTransport):
         await self._link.send_frame(
             stream_id,
             "meta",
-            _encode_json_bytes(request_start),
+            encode_json_bytes(request_start),
         )
 
         if body:
@@ -194,7 +186,7 @@ class AethernetHttpTransport(httpx.AsyncBaseTransport):
         await self._link.send_frame(
             stream_id,
             "meta",
-            _encode_json_bytes({"kind": "request_end"}),
+            encode_json_bytes({"kind": "request_end"}),
             end=True,
         )
 
@@ -202,7 +194,7 @@ class AethernetHttpTransport(httpx.AsyncBaseTransport):
         if first.frame_type != "meta":
             raise RuntimeError("Protocol error: expected response_start meta frame")
 
-        meta = _decode_json_bytes(first.payload)
+        meta = decode_json_bytes(first.payload)
         kind = meta.get("kind")
 
         if kind == "error":
@@ -238,7 +230,7 @@ class AethernetHttpTransport(httpx.AsyncBaseTransport):
             if frame.frame_type != "meta":
                 continue
 
-            meta = _decode_json_bytes(frame.payload)
+            meta = decode_json_bytes(frame.payload)
             kind = meta.get("kind")
 
             if kind == "response_end":
@@ -314,7 +306,7 @@ class LinkHTTPProxyServer:
                 )
                 return
 
-            meta = _decode_json_bytes(first.payload)
+            meta = decode_json_bytes(first.payload)
             if meta.get("kind") != "request_start":
                 await self._send_error(
                     stream_id, "Protocol error: expected request_start"
@@ -339,7 +331,7 @@ class LinkHTTPProxyServer:
                 if frame.frame_type != "meta":
                     continue
 
-                meta = _decode_json_bytes(frame.payload)
+                meta = decode_json_bytes(frame.payload)
                 kind = meta.get("kind")
 
                 if kind == "request_end":
@@ -372,7 +364,7 @@ class LinkHTTPProxyServer:
             await self._link.send_frame(
                 stream_id,
                 "meta",
-                _encode_json_bytes(
+                encode_json_bytes(
                     {
                         "kind": "response_start",
                         "status_code": resp.status_code,
@@ -391,7 +383,7 @@ class LinkHTTPProxyServer:
                 await self._link.send_frame(
                     stream_id,
                     "meta",
-                    _encode_json_bytes({"kind": "response_end"}),
+                    encode_json_bytes({"kind": "response_end"}),
                     end=True,
                 )
                 await resp.aclose()
@@ -425,7 +417,7 @@ class LinkHTTPProxyServer:
             await self._link.send_frame(
                 stream_id,
                 "meta",
-                _encode_json_bytes({"kind": "response_end"}),
+                encode_json_bytes({"kind": "response_end"}),
                 end=True,
             )
         finally:
@@ -435,6 +427,6 @@ class LinkHTTPProxyServer:
         await self._link.send_frame(
             stream_id,
             "meta",
-            _encode_json_bytes({"kind": "error", "message": message}),
+            encode_json_bytes({"kind": "error", "message": message}),
             end=True,
         )

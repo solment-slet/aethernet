@@ -1,20 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
 import websockets
 
 from aethernet.transport import AggregatingLink
-
-
-def _encode_json_bytes(obj: dict[str, Any]) -> bytes:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-
-def _decode_json_bytes(data: bytes) -> dict[str, Any]:
-    return json.loads(data.decode("utf-8"))
+from aethernet.transport._utils import encode_json_bytes, decode_json_bytes
 
 
 class LinkWebSocketProxyServer:
@@ -59,7 +51,7 @@ class LinkWebSocketProxyServer:
         if first.frame_type != "meta":
             return
 
-        meta = _decode_json_bytes(first.payload)
+        meta = decode_json_bytes(first.payload)
         if meta.get("kind") != "ws_open":
             # stream не наш; в текущем дизайне это проблема,
             # потому что мы уже съели первый frame.
@@ -84,7 +76,7 @@ class LinkWebSocketProxyServer:
                 await self._link.send_frame(
                     stream_id,
                     "meta",
-                    _encode_json_bytes(
+                    encode_json_bytes(
                         {
                             "kind": "ws_opened",
                             "subprotocol": ws.subprotocol,
@@ -115,7 +107,7 @@ class LinkWebSocketProxyServer:
             await self._link.send_frame(
                 stream_id,
                 "meta",
-                _encode_json_bytes(
+                encode_json_bytes(
                     {"kind": "error", "message": f"{type(e).__name__}: {e}"}
                 ),
                 end=True,
@@ -134,7 +126,7 @@ class LinkWebSocketProxyServer:
             await self._link.send_frame(
                 stream_id,
                 "meta",
-                _encode_json_bytes(
+                encode_json_bytes(
                     {
                         "kind": "ws_closed",
                         "code": getattr(ws, "close_code", None),
@@ -147,7 +139,7 @@ class LinkWebSocketProxyServer:
             await self._link.send_frame(
                 stream_id,
                 "meta",
-                _encode_json_bytes(
+                encode_json_bytes(
                     {"kind": "error", "message": f"{type(e).__name__}: {e}"}
                 ),
                 end=True,
@@ -168,7 +160,7 @@ class LinkWebSocketProxyServer:
             if frame.frame_type != "meta":
                 continue
 
-            meta = _decode_json_bytes(frame.payload)
+            meta = decode_json_bytes(frame.payload)
             kind = meta.get("kind")
 
             if kind == "ws_close":

@@ -1,4 +1,6 @@
 from aethernet.transport.http_over_link.http_over_link import (
-    AethernetHttpTransport,
+    AethernetHttpx,
     LinkHTTPProxyServer,
 )
+
+__all__ = ["AethernetHttpx", "LinkHTTPProxyServer"]

@@ -1,13 +1,22 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Sequence
+from typing import Any, AsyncIterator, Sequence, Mapping
 
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK, InvalidStatus
+from websockets.exceptions import (
+    ConnectionClosed,
+    ConnectionClosedError,
+    ConnectionClosedOK,
+    InvalidStatus,
+)
 from websockets.frames import Close
+from websockets.http11 import Response
+from websockets.datastructures import Headers
 
 from aethernet.transport import AggregatingLink
+from aethernet.transport._utils import encode_json_bytes, decode_json_bytes
+
+HeadersLike = Any
 
 
 # ---------------------------------------------------------------------------
@@ -15,22 +24,29 @@ from aethernet.transport import AggregatingLink
 # ---------------------------------------------------------------------------
 
 
-def _encode_json_bytes(obj: dict[str, Any]) -> bytes:
-    """Сериализует dict в компактный UTF-8 JSON."""
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+def _normalize_headers(headers: HeadersLike) -> list[tuple[str, str]]:
+    """
+    Normalize headers into a list of (key, value) string tuples.
+    """
+    if isinstance(headers, Mapping):
+        pairs = headers.items()
+    else:
+        pairs = headers
 
-
-def _decode_json_bytes(data: bytes) -> dict[str, Any]:
-    """Десериализует UTF-8 JSON bytes в dict."""
-    return json.loads(data.decode("utf-8"))
+    result = []
+    for item in pairs:
+        k, v = item
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise TypeError(
+                f"Header key and value must be str, got {type(k)!r} and {type(v)!r}"
+            )
+        result.append((k, v))
+    return result
 
 
 def _make_connection_closed(code: int | None, reason: str) -> ConnectionClosed:
     """
-    Создаёт нативное исключение websockets на основе кода закрытия.
-
-    Код 1000/1001 считается нормальным завершением (ConnectionClosedOK),
-    всё остальное — аварийным (ConnectionClosedError).
+    Construct a websocket ConnectionClosed exception from a close frame.
     """
     rcvd = Close(code=code or 1006, reason=reason)
     if code in (1000, 1001):
@@ -45,7 +61,9 @@ def _make_connection_closed(code: int | None, reason: str) -> ConnectionClosed:
 
 @dataclass(slots=True)
 class WSOpenResult:
-    """Результат успешного открытия WebSocket-соединения."""
+    """
+    Result returned when a WebSocket connection is successfully opened.
+    """
 
     subprotocol: str | None
 
@@ -57,54 +75,35 @@ class WSOpenResult:
 
 class LinkWebSocketClient:
     """
-    Клиентская сторона WebSocket на машине A поверх AggregatingLink.
+    WebSocket client running on node A over an AggregatingLink.
 
-    Имитирует интерфейс ``websockets.ClientConnection``:
-      - ``send(str | bytes)``
-      - ``recv() -> str | bytes``
-      - ``close()``
-      - ``async for message in ws: ...``
-
-    Исключения при закрытии соединения — нативные ``ConnectionClosed``
-    из библиотеки ``websockets``, поэтому ловцы не видят разницы с
-    обычным websockets-клиентом.
+    This class mimics the interface of ``websockets.ClientConnection``.
     """
 
     def __init__(
         self,
         link: AggregatingLink,
         stream_id: str,
-        websockets: AethernetWebSockets,
         subprotocol: str | None,
     ) -> None:
         self._link = link
         self._stream_id = stream_id
-        self._websockets = websockets
-
-        #: Согласованный субпротокол (None если не использовался).
-        self.subprotocol = subprotocol
-
+        self._subprotocol = subprotocol
         self._closed = False
         self.close_code: int | None = None
         self.close_reason: str = ""
 
     @property
     def stream_id(self) -> str:
-        """Идентификатор потока внутри AggregatingLink."""
         return self._stream_id
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    @property
+    def subprotocol(self) -> str | None:
+        return self._subprotocol
 
     async def send(self, data: str | bytes) -> None:
         """
-        Отправляет текстовое или бинарное сообщение на удалённую сторону.
-
-        :param data: Строка отправляется как ``ws_text``,
-                     bytes/bytearray/memoryview — как ``ws_binary``.
-        :raises ConnectionClosed: Если соединение уже закрыто.
-        :raises TypeError: Если передан неподдерживаемый тип.
+        Send a text or binary message over the WebSocket.
         """
         if self._closed:
             raise _make_connection_closed(self.close_code, self.close_reason)
@@ -122,15 +121,11 @@ class LinkWebSocketClient:
                 bytes(data),
             )
         else:
-            raise TypeError(f"send() принимает str | bytes, получен {type(data).__name__!r}")
+            raise TypeError(f"send() accepts str | bytes, got {type(data).__name__!r}")
 
     async def recv(self) -> str | bytes:
         """
-        Ожидает и возвращает следующее сообщение от удалённой стороны.
-
-        :returns: ``str`` для текстовых фреймов, ``bytes`` для бинарных.
-        :raises ConnectionClosed: Если соединение закрыто нормально или с ошибкой.
-        :raises RuntimeError: При протокольной ошибке на удалённой стороне.
+        Receive the next message from the WebSocket.
         """
         if self._closed:
             raise _make_connection_closed(self.close_code, self.close_reason)
@@ -144,11 +139,10 @@ class LinkWebSocketClient:
             if frame.frame_type == "ws_binary":
                 return frame.payload
 
-            # Не-meta фреймы пропускаем (служебные, future-proof)
             if frame.frame_type != "meta":
                 continue
 
-            meta = _decode_json_bytes(frame.payload)
+            meta = decode_json_bytes(frame.payload)
             kind = meta.get("kind")
 
             if kind == "ws_closed":
@@ -159,16 +153,11 @@ class LinkWebSocketClient:
 
             if kind == "error":
                 self._closed = True
-                raise RuntimeError(meta.get("message", "remote websocket error"))
+                raise RuntimeError(meta.get("message", "Remote WebSocket error"))
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         """
-        Инициирует закрытие соединения с удалённой стороной.
-
-        Повторный вызов на уже закрытом соединении — no-op.
-
-        :param code: Код закрытия WebSocket (по умолчанию 1000 — нормальное закрытие).
-        :param reason: Человекочитаемая причина закрытия.
+        Gracefully close the WebSocket connection.
         """
         if self._closed:
             return
@@ -176,26 +165,16 @@ class LinkWebSocketClient:
         await self._link.send_frame(
             self._stream_id,
             "meta",
-            _encode_json_bytes(
-                {
-                    "kind": "ws_close",
-                    "code": code,
-                    "reason": reason,
-                }
-            ),
+            encode_json_bytes({"kind": "ws_close", "code": code, "reason": reason}),
             end=True,
         )
-
         self._closed = True
         self.close_code = code
         self.close_reason = reason
 
     async def __aiter__(self) -> AsyncIterator[str | bytes]:
         """
-        Итерирует входящие сообщения до закрытия соединения.
-
-        Совместим с ``async for message in ws``, как в стандартном websockets.
-        ``ConnectionClosed`` поглощается — итерация просто завершается.
+        Async iterator over incoming WebSocket messages.
         """
         while True:
             try:
@@ -205,99 +184,183 @@ class LinkWebSocketClient:
 
 
 # ---------------------------------------------------------------------------
-# Module-level facade
+# Connector
+# ---------------------------------------------------------------------------
+
+
+class _WebSocketConnector:
+    """
+    Returned by AethernetWebSockets.connect().
+
+    Supports two usage styles:
+
+    1) Await style (manual close):
+        ws = await AethernetWebSockets(link).connect("wss://...")
+
+    2) Async context manager (auto close):
+        async with AethernetWebSockets(link).connect("wss://...") as ws:
+            ...
+    """
+
+    def __init__(
+        self,
+        link: AggregatingLink,
+        uri: str,
+        *,
+        origin: str | None = None,
+        subprotocols: Sequence[str] | None = None,
+        compression: str | None = None,
+        additional_headers: HeadersLike | None = None,
+        user_agent_header: str | None = None,
+        proxy: str | None = None,
+        open_timeout: float | None = None,
+        ping_interval: float | None = None,
+        ping_timeout: float | None = None,
+        close_timeout: float | None = None,
+        max_size: int | None | tuple[int | None, int | None] = 2**20,
+        max_queue: int | None | tuple[int | None, int | None] = 16,
+        write_limit: int | tuple[int, int | None] = 2**15,
+    ) -> None:
+        self._link = link
+        self._uri = uri
+        self._params = dict(
+            origin=origin,
+            subprotocols=None if subprotocols is None else list(subprotocols),
+            compression=compression,
+            additional_headers=(
+                None
+                if additional_headers is None
+                else _normalize_headers(additional_headers)
+            ),
+            user_agent_header=user_agent_header,
+            proxy=proxy,
+            open_timeout=open_timeout,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            close_timeout=close_timeout,
+            max_size=max_size,
+            max_queue=max_queue,
+            write_limit=write_limit,
+        )
+        self._client: LinkWebSocketClient | None = None
+
+    async def _open(self) -> LinkWebSocketClient:
+        """
+        Perform the WebSocket handshake over AggregatingLink.
+        """
+        stream_id = self._link.new_stream_id()
+
+        await self._link.send_frame(
+            stream_id,
+            "meta",
+            encode_json_bytes({"kind": "ws_open", "uri": self._uri, **self._params}),
+        )
+
+        first = await self._link.recv_frame(stream_id)
+        if first.frame_type != "meta":
+            raise RuntimeError("Protocol error: expected meta frame (ws_opened/error)")
+
+        meta = decode_json_bytes(first.payload)
+        kind = meta.get("kind")
+
+        if kind == "error":
+            message = meta.get("message", "WebSocket open failed")
+            raise InvalidStatus(
+                Response(
+                    status_code=403,
+                    reason_phrase="Forbidden",
+                    headers=Headers(),
+                    body=message.encode("utf-8"),
+                )
+            )
+
+        if kind != "ws_opened":
+            raise RuntimeError(f"Protocol error: expected ws_opened, got {kind!r}")
+
+        return LinkWebSocketClient(
+            link=self._link,
+            stream_id=stream_id,
+            subprotocol=meta.get("subprotocol"),
+        )
+
+    # --- awaitable interface ---
+
+    def __await__(self):
+        return self._open().__await__()
+
+    # --- async context manager ---
+
+    async def __aenter__(self) -> LinkWebSocketClient:
+        self._client = await self._open()
+        return self._client
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._client is not None:
+            await self._client.close()
+
+
+# ---------------------------------------------------------------------------
+# Facade
 # ---------------------------------------------------------------------------
 
 
 class AethernetWebSockets:
     """
-    Фасад, имитирующий модуль ``websockets`` поверх AggregatingLink.
+    Facade that emulates the ``websockets`` module over AggregatingLink.
 
-    Использование::
+    Example usage:
 
-        ws = AethernetWebSockets(link)
-        async with ws.connect("wss://example.com") as conn:
-            await conn.send("hello")
-            msg = await conn.recv()
+        ws_factory = AethernetWebSockets(link)
 
-    Ограничение: одновременно поддерживается только одно соединение.
+        # Option 1: manual lifecycle
+        ws = await ws_factory.connect("wss://example.com")
+        await ws.send("hello")
+        await ws.close()
+
+        # Option 2: context manager
+        async with ws_factory.connect("wss://example.com") as ws:
+            await ws.send("hello")
+            msg = await ws.recv()
     """
 
     def __init__(self, link: AggregatingLink) -> None:
         self._link = link
 
-    async def connect(
+    def connect(
         self,
-        url: str,
+        uri: str,
         *,
-        additional_headers: list[tuple[str, str]] | None = None,
+        origin: str | None = None,
         subprotocols: Sequence[str] | None = None,
-    ) -> LinkWebSocketClient:
+        compression: str | None = None,
+        additional_headers: HeadersLike | None = None,
+        user_agent_header: str | None = None,
+        proxy: str | None = None,
+        open_timeout: float | None = None,
+        ping_interval: float | None = None,
+        ping_timeout: float | None = None,
+        close_timeout: float | None = None,
+        max_size: int | None | tuple[int | None, int | None] = 2**20,
+        max_queue: int | None | tuple[int | None, int | None] = 16,
+        write_limit: int | tuple[int, int | None] = 2**15,
+    ) -> _WebSocketConnector:
         """
-        Открывает WebSocket-соединение к ``url`` через AggregatingLink.
-
-        :param url: Целевой WebSocket URL (``ws://`` или ``wss://``).
-        :param additional_headers: Дополнительные HTTP-заголовки для хендшейка.
-        :param subprotocols: Список желаемых субпротоколов.
-        :returns: Готовый к использованию ``LinkWebSocketClient``.
-        :raises InvalidStatus: Если удалённая сторона отклонила соединение.
-        :raises RuntimeError: При протокольной ошибке.
+        Create a WebSocket connection over AggregatingLink.
         """
-        stream_id = self._link.new_stream_id()
-
-        # Отправляем запрос на открытие соединения
-        await self._link.send_frame(
-            stream_id,
-            "meta",
-            _encode_json_bytes(
-                {
-                    "kind": "ws_open",
-                    "url": url,
-                    "headers": list(additional_headers) if additional_headers else [],
-                    "subprotocols": list(subprotocols) if subprotocols else [],
-                }
-            ),
+        return _WebSocketConnector(
+            self._link,
+            uri,
+            origin=origin,
+            subprotocols=subprotocols,
+            compression=compression,
+            additional_headers=additional_headers,
+            user_agent_header=user_agent_header,
+            proxy=proxy,
+            open_timeout=open_timeout,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            close_timeout=close_timeout,
+            max_size=max_size,
+            max_queue=max_queue,
+            write_limit=write_limit,
         )
-
-        # Ждём подтверждения от удалённой стороны
-        first = await self._link.recv_frame(stream_id)
-        if first.frame_type != "meta":
-            raise RuntimeError("Протокольная ошибка: ожидался meta-фрейм ws_opened/error")
-
-        meta = _decode_json_bytes(first.payload)
-        kind = meta.get("kind")
-
-        if kind == "error":
-            # Имитируем InvalidStatus как настоящий websockets
-            raise InvalidStatus(_FakeResponse(message=meta.get("message", "ws open failed")))
-
-        if kind != "ws_opened":
-            raise RuntimeError(f"Протокольная ошибка: ожидался ws_opened, получен {kind!r}")
-
-        return LinkWebSocketClient(
-            link=self._link,
-            stream_id=stream_id,
-            websockets=self,
-            subprotocol=meta.get("subprotocol"),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-class _FakeResponse:
-    """
-    Минимальная заглушка HTTP-ответа для создания ``InvalidStatus``.
-
-    ``InvalidStatus`` из websockets требует объект с атрибутом ``status_code``.
-    Используется только внутри ``AethernetWebSockets.connect``.
-    """
-
-    status_code: int = 403
-    headers: dict[str, str] = {}
-    body: bytes = b""
-
-    def __init__(self, message: str = "") -> None:
-        self.message = message

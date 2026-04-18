@@ -104,63 +104,50 @@ class AggregatingLink:
         *,
         logger: LoggerLike = logging.getLogger(__name__),
         flush_interval: float = 0.5,
-        min_send_interval: float = 0.25,
         max_batch_size: int = 64 * 1024,
-        recv_restart_delay: float = 0.0,
         chunk_assembly_ttl: float = 60.0,
     ) -> None:
         """
         Args:
             transport: Синхронный низкоуровневый транспорт.
             flush_interval: Максимальное время ожидания перед отправкой батча.
-            min_send_interval: Минимальный интервал между ЛЮБЫМИ physical send().
             max_batch_size: Максимальный размер logical batch в байтах.
-            recv_restart_delay: Пауза между итерациями recv loop.
             chunk_assembly_ttl: Время жизни незавершённой сборки chunk-пакетов.
         """
         self._logger = logger
         self._transport = transport
 
         self._flush_interval = flush_interval
-        self._min_send_interval = min_send_interval
-        self._recv_restart_delay = recv_restart_delay
+        self._min_send_interval = self._transport.low_transport.min_send_interval
+        self._recv_restart_delay = self._transport.low_transport.min_recv_interval
         self._chunk_assembly_ttl = chunk_assembly_ttl
+
+        self._shutdown_task = asyncio.create_task(self._shutdown_watcher())
 
         # Если transport знает свой лимит полезной нагрузки для одного send(),
         # используем его для transport-level framing.
-        self._transport_limit: int | None = getattr(
-            transport, "max_payload_bytes", None
+        self._transport_limit: int = self._transport.max_payload_bytes
+
+        self._single_packet_payload_limit = self._transport_limit - len(
+            self.SINGLE_MAGIC
+        )
+        self._chunk_packet_payload_limit = (
+            self._transport_limit - len(self.CHUNK_MAGIC) - self._CHUNK_META_STRUCT.size
         )
 
-        if self._transport_limit is not None:
-            self._single_packet_payload_limit = self._transport_limit - len(
-                self.SINGLE_MAGIC
-            )
-            self._chunk_packet_payload_limit = (
-                self._transport_limit
-                - len(self.CHUNK_MAGIC)
-                - self._CHUNK_META_STRUCT.size
+        if self._single_packet_payload_limit <= 0:
+            raise ValueError(
+                "transport.max_payload_bytes too small for SINGLE packet framing"
             )
 
-            if self._single_packet_payload_limit <= 0:
-                raise ValueError(
-                    "transport.max_payload_bytes too small for SINGLE packet framing"
-                )
-
-            if self._chunk_packet_payload_limit <= 0:
-                raise ValueError(
-                    "transport.max_payload_bytes too small for CHUNK packet framing"
-                )
-
-            # Чтобы writer loop по умолчанию старался укладываться в один physical packet,
-            # автоматически сужаем max_batch_size до single packet payload limit.
-            self._max_batch_size = min(
-                max_batch_size, self._single_packet_payload_limit
+        if self._chunk_packet_payload_limit <= 0:
+            raise ValueError(
+                "transport.max_payload_bytes too small for CHUNK packet framing"
             )
-        else:
-            self._single_packet_payload_limit = None
-            self._chunk_packet_payload_limit = None
-            self._max_batch_size = max_batch_size
+
+        # Чтобы writer loop по умолчанию старался укладываться в один physical packet,
+        # автоматически сужаем max_batch_size до single packet payload limit.
+        self._max_batch_size = min(max_batch_size, self._single_packet_payload_limit)
 
         # Очередь исходящих logical frame.
         self._outgoing: asyncio.Queue[Frame] = asyncio.Queue()
@@ -227,9 +214,6 @@ class AggregatingLink:
             self._logger.info("AggregatingLink started")
 
     async def close(self) -> None:
-        """
-        Останавливает link и уведомляет все активные stream-очереди о закрытии.
-        """
         async with self._lock:
             if self._closed:
                 return
@@ -237,22 +221,22 @@ class AggregatingLink:
             self._closed = True
             self._stop_event.set()
 
+            self._logger.info("Завершаем")
+            # Выполняем синхронный close в отдельном потоке
+            await asyncio.to_thread(self._transport.low_transport.close)
+            self._logger.info("Завершено")
+
+            # Отменяем tasks
             tasks = [t for t in (self._reader_task, self._writer_task) if t is not None]
             for task in tasks:
                 task.cancel()
 
+        # Ждем завершения
         for task in tasks:
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-
-        for q in self._incoming_by_stream.values():
-            q.put_nowait(
-                Frame(stream_id="__control__", frame_type="__closed__", end=True)
-            )
-
-        self._logger.info("AggregatingLink closed")
 
     async def accept_stream(self) -> str:
         """
@@ -359,7 +343,9 @@ class AggregatingLink:
         try:
             while not self._stop_event.is_set():
                 try:
-                    raw_packet = await asyncio.to_thread(self._transport.recv)
+                    raw_packet = await asyncio.to_thread(
+                        self._transport.recv, self._recv_restart_delay
+                    )
 
                     self._logger.debug(
                         "AggregatingLink recv physical packet: size={}, prefix={}",
@@ -652,7 +638,9 @@ class AggregatingLink:
         ]
 
         for msg_id in stale_ids:
-            self._logger.warning("Dropping stale chunk assembly: msg_id={}", msg_id.hex())
+            self._logger.warning(
+                "Dropping stale chunk assembly: msg_id={}", msg_id.hex()
+            )
             del self._chunk_assemblies[msg_id]
 
     @staticmethod
@@ -735,3 +723,9 @@ class AggregatingLink:
             )
 
         return frames
+
+    async def _shutdown_watcher(self):
+        try:
+            await asyncio.Future()
+        finally:
+            await self.close()
