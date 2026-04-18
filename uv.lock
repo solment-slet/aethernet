@@ -8,17 +8,20 @@ version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "basex-python" },
-    { name = "build" },
     { name = "httpx" },
     { name = "msgpack" },
     { name = "pycryptodome" },
-    { name = "twine" },
     { name = "websockets" },
 ]
 
 [package.optional-dependencies]
+build = [
+    { name = "build" },
+    { name = "twine" },
+]
 dev = [
     { name = "black" },
+    { name = "build" },
     { name = "hypothesis" },
     { name = "mypy" },
     { name = "pytest" },
@@ -26,6 +29,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-mock" },
     { name = "ruff" },
+    { name = "twine" },
 ]
 lint = [
     { name = "black" },
@@ -42,10 +46,10 @@ tests = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aethernet-core", extras = ["tests", "lint"], marker = "extra == 'dev'" },
+    { name = "aethernet-core", extras = ["tests", "lint", "build"], marker = "extra == 'dev'" },
     { name = "basex-python", specifier = "==0.1.0" },
     { name = "black", marker = "extra == 'lint'", specifier = ">=26.3,<27" },
-    { name = "build", specifier = ">=1.4.3" },
+    { name = "build", marker = "extra == 'build'", specifier = ">=1.4.3" },
     { name = "httpx", specifier = ">=0.28.1,<0.29" },
     { name = "hypothesis", marker = "extra == 'tests'", specifier = ">=6.152,<7" },
     { name = "msgpack", specifier = ">=1.1.2,<2" },
@@ -56,10 +60,10 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'tests'", specifier = ">=7.1,<8" },
     { name = "pytest-mock", marker = "extra == 'tests'", specifier = ">=3.15,<4" },
     { name = "ruff", marker = "extra == 'lint'", specifier = ">=0.15,<1" },
-    { name = "twine", specifier = ">=6.2.0" },
+    { name = "twine", marker = "extra == 'build'", specifier = ">=6.2.0" },
     { name = "websockets", specifier = ">=16.0,<16.1" },
 ]
-provides-extras = ["tests", "lint", "dev"]
+provides-extras = ["tests", "lint", "build", "dev"]
 
 [[package]]
 name = "anyio"
