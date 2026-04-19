@@ -17,8 +17,9 @@ jobs:
       - name: Build distributions
         run: |
           rm -rf dist/
-          pip install build
+          pip install build hatchling
           python -m build
+          unzip -p dist/aethernet_core-1.0.1-py3-none-any.whl "*.dist-info/METADATA" | head -5
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
