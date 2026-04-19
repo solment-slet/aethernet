@@ -39,6 +39,12 @@ jobs:
           name: dists
           path: dist/
 
+      - name: Debug wheel
+        run: |
+          ls -la dist/
+          python3 -m zipfile -l dist/aethernet_core-1.0.1-py3-none-any.whl
+          unzip -p dist/aethernet_core-1.0.1-py3-none-any.whl "*.dist-info/METADATA" | head -10
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@fb13cb306901256ace3dab689990e13a5550ffaa  # v1.11.0
         with:
