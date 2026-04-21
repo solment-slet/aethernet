@@ -96,7 +96,7 @@ class _InFlightPacket:
 
 _PACKET_MAGIC = b"AGP1"
 _PACKET_HEADER_STRUCT = struct.Struct(">IB")  # seq: uint32, ack_count: uint8
-_ACK_SEQ_STRUCT = struct.Struct(">I")  # один ack_seq: uint32
+_ACK_SEQ_STRUCT = struct.Struct(">I")         # один ack_seq: uint32
 
 # Заголовок без ACK и без payload
 _MIN_PACKET_HEADER_SIZE = len(_PACKET_MAGIC) + _PACKET_HEADER_STRUCT.size
@@ -122,7 +122,7 @@ def _parse_packet(raw: bytes) -> tuple[int, list[int], bytes]:
         (seq, ack_seqs, payload)
 
     Raises:
-        ValueError: Если пакет повреждён.
+        ValueError: Если пакет повреждён или magic не совпадает.
     """
     if not raw.startswith(_PACKET_MAGIC):
         raise ValueError(f"unknown packet magic: {raw[:4]!r}")
@@ -163,9 +163,24 @@ class AggregatingLink:
     - если logical batch слишком большой для Transport, он режется на transport chunks
 
     Режимы надёжности (ReliabilityMode):
-    - NONE          — без подтверждений (оригинальное поведение)
-    - STOP_AND_WAIT — Stop-and-Wait ARQ (window_size=1)
+    - NONE          — без подтверждений (оригинальное поведение, порядок не гарантирован)
+    - STOP_AND_WAIT — Stop-and-Wait ARQ (window_size=1, порядок гарантирован)
     - PARALLEL      — Selective-Repeat ARQ с окном window_size > 1
+
+    Порядок доставки в режиме PARALLEL:
+        Отправитель нумерует каждый физический пакет (seq).
+        Получатель держит reorder buffer: батчи не передаются в стримы
+        пока не получены все батчи с меньшим seq. Это гарантирует строгий
+        порядок доставки frame между батчами несмотря на то, что
+        ретрансмиты могут приходить позже изначально следующих пакетов.
+
+        Пример без reorder buffer (неправильно):
+            Отправлено:   batch[seq=1], batch[seq=2], batch[seq=3]
+            Потерян seq=1, ретрансмит приходит позже:
+            Получено:     seq=2 → отдаём, seq=3 → отдаём, seq=1 → отдаём  (порядок сломан)
+
+        С reorder buffer (правильно):
+            Получено:     seq=2 → буфер, seq=3 → буфер, seq=1 → flush [1,2,3] (порядок верный)
 
     При STOP_AND_WAIT и PARALLEL:
     - каждый physical send получает порядковый номер seq
@@ -205,19 +220,24 @@ class AggregatingLink:
         window_size: int = 8,
         ack_flush_interval: float = 0.1,
         ack_batch_size: int = 8,
-        received_seqs_window: int = 256,  # window_size * 4. Default: 256
+        received_seqs_window: int = 256,
+        reorder_buffer_ttl: float = 60.0,
     ) -> None:
         """
         Args:
             transport: Синхронный низкоуровневый транспорт.
-            flush_interval: Maximum waiting time before sending a batch.
-            max_batch_size: Maximum logical batch size in bytes.
-            chunk_assembly_ttl: Lifetime of an incomplete chunk assembly.
-            reliability_mode: Delivery reliability mode.
-            window_size: Window size for PARALLEL mode.
-            ack_flush_interval: Maximum ACK accumulation time before sending.
-            ack_batch_size: Maximum number of ACKs in a single flush.
-            received_seqs_window: How many recent seqs to store for deduplication.
+            flush_interval: Максимальное время ожидания перед отправкой батча.
+            max_batch_size: Максимальный размер logical batch в байтах.
+            chunk_assembly_ttl: Время жизни незавершённой сборки chunk-пакетов.
+            reliability_mode: Режим надёжности доставки.
+            window_size: Размер окна для режима PARALLEL.
+            ack_flush_interval: Максимальное время накопления ACK перед отправкой.
+            ack_batch_size: Максимальное количество ACK в одном flush.
+            received_seqs_window: Сколько последних seq хранить для дедупликации.
+                Разумный минимум: window_size * 4. Default: 256.
+            reorder_buffer_ttl: Время жизни записи в reorder buffer без flush (сек).
+                Защита от бесконечного роста если пакет потерян навсегда.
+                На практике не срабатывает — ретрансмит бесконечный.
         """
         self._logger = logger
         self._transport = transport
@@ -237,32 +257,24 @@ class AggregatingLink:
         self._ack_flush_interval = ack_flush_interval
         self._ack_batch_size = ack_batch_size
         self._received_seqs_window = received_seqs_window
+        self._reorder_buffer_ttl = reorder_buffer_ttl
 
         self._shutdown_task = asyncio.create_task(self._shutdown_watcher())
 
         self._transport_limit: int = self._transport.max_payload_bytes
 
-        self._single_packet_payload_limit = self._transport_limit - len(
-            self.SINGLE_MAGIC
-        )
+        self._single_packet_payload_limit = self._transport_limit - len(self.SINGLE_MAGIC)
         self._chunk_packet_payload_limit = (
             self._transport_limit - len(self.CHUNK_MAGIC) - self._CHUNK_META_STRUCT.size
         )
-        # payload limit для нового AGP1 формата (без ACK — их добавим позже при необходимости)
         self._agp1_payload_limit = self._transport_limit - _MIN_PACKET_HEADER_SIZE
 
         if self._single_packet_payload_limit <= 0:
-            raise ValueError(
-                "transport.max_payload_bytes too small for SINGLE packet framing"
-            )
+            raise ValueError("transport.max_payload_bytes too small for SINGLE packet framing")
         if self._chunk_packet_payload_limit <= 0:
-            raise ValueError(
-                "transport.max_payload_bytes too small for CHUNK packet framing"
-            )
+            raise ValueError("transport.max_payload_bytes too small for CHUNK packet framing")
         if self._agp1_payload_limit <= 0:
-            raise ValueError(
-                "transport.max_payload_bytes too small for AGP1 packet framing"
-            )
+            raise ValueError("transport.max_payload_bytes too small for AGP1 packet framing")
 
         self._max_batch_size = min(max_batch_size, self._single_packet_payload_limit)
 
@@ -277,25 +289,28 @@ class AggregatingLink:
         self._chunk_assemblies: dict[bytes, _ChunkAssembly] = {}
 
         # --- reliability: sender side ---
-        # Пакеты в полёте: seq → _InFlightPacket
         self._in_flight: dict[int, _InFlightPacket] = {}
-        # Счётчик seq (начинаем с 1, 0 зарезервирован для ACK-only)
         self._seq_counter: int = 1
-        # Семафор ограничивает количество одновременно летящих пакетов
         self._window_semaphore: asyncio.Semaphore = asyncio.Semaphore(self._window_size)
-        # Событие: пришёл новый ACK → retransmit loop может проснуться
         self._ack_received_event: asyncio.Event = asyncio.Event()
 
         # --- reliability: receiver side ---
-        # Скользящее окно последних received_seqs_window seq для дедупликации.
-        # deque с maxlen автоматически вытесняет старые записи — нет утечки памяти.
+        # Скользящее окно для дедупликации входящих seq.
         self._received_seqs: deque[int] = deque(maxlen=self._received_seqs_window)
-        # set-представление для O(1) проверки вхождения
         self._received_seqs_set: set[int] = set()
         # Очередь seq ожидающих отправки ACK
         self._pending_acks: asyncio.Queue[int] = asyncio.Queue()
-        # Событие: есть ACK для отправки (будит ACK aggregator)
         self._has_pending_acks: asyncio.Event = asyncio.Event()
+
+        # --- reorder buffer (только PARALLEL) ---
+        # Хранит батчи которые пришли раньше чем их предшественники.
+        # Ключ — seq пакета. Значение — (logical_payload, arrival_time).
+        # next_expected_seq — следующий seq который должен быть передан в стримы.
+        # В STOP_AND_WAIT и NONE reorder buffer не используется:
+        #   NONE       — нет seq вообще
+        #   SAW        — window=1, out-of-order невозможен физически
+        self._reorder_buffer: dict[int, tuple[bytes, float]] = {}
+        self._next_expected_seq: int = 1
 
         # --- tasks ---
         self._reader_task: asyncio.Task[None] | None = None
@@ -365,8 +380,7 @@ class AggregatingLink:
             await asyncio.to_thread(self._transport.low_transport.close)
 
             tasks = [
-                t
-                for t in (
+                t for t in (
                     self._reader_task,
                     self._writer_task,
                     self._retransmit_task,
@@ -462,23 +476,19 @@ class AggregatingLink:
 
                 try:
                     if self._reliability_mode == ReliabilityMode.NONE:
-                        logical_payloads = self._decode_legacy_transport_packet(
-                            raw_packet
-                        )
+                        logical_payloads = self._decode_legacy_transport_packet(raw_packet)
                         ack_seqs_received: list[int] = []
                     else:
-                        seq, ack_seqs_received, logical_payloads = (
-                            self._decode_agp1_packet(raw_packet)
-                        )
+                        logical_payloads, ack_seqs_received = self._decode_agp1_packet(raw_packet)
                 except Exception as e:
                     self._logger.error(f"Получен битый transport packet: {e}")
                     continue
 
-                # --- обработка входящих ACK ---
                 if ack_seqs_received:
                     self._process_incoming_acks(ack_seqs_received)
 
                 self._cleanup_stale_chunk_assemblies()
+                self._cleanup_stale_reorder_buffer()
 
                 for logical_payload in logical_payloads:
                     try:
@@ -493,18 +503,7 @@ class AggregatingLink:
                     )
 
                     for frame in frames:
-                        is_new_stream = frame.stream_id not in self._incoming_by_stream
-                        queue = self._incoming_by_stream.setdefault(
-                            frame.stream_id, asyncio.Queue()
-                        )
-                        queue.put_nowait(frame)
-
-                        if (
-                            is_new_stream
-                            and frame.stream_id not in self._seen_incoming_streams
-                        ):
-                            self._seen_incoming_streams.add(frame.stream_id)
-                            self._new_stream_notifications.put_nowait(frame.stream_id)
+                        self._dispatch_frame(frame)
 
                 if self._recv_restart_delay > 0:
                     await asyncio.sleep(self._recv_restart_delay)
@@ -513,47 +512,111 @@ class AggregatingLink:
             self._logger.debug("reader loop cancelled")
             raise
 
-    def _decode_agp1_packet(self, raw: bytes) -> tuple[int, list[int], list[bytes]]:
+    def _dispatch_frame(self, frame: Frame) -> None:
+        """Кладёт frame в очередь нужного стрима и уведомляет о новом стриме."""
+        is_new_stream = frame.stream_id not in self._incoming_by_stream
+        queue = self._incoming_by_stream.setdefault(frame.stream_id, asyncio.Queue())
+        queue.put_nowait(frame)
+
+        if is_new_stream and frame.stream_id not in self._seen_incoming_streams:
+            self._seen_incoming_streams.add(frame.stream_id)
+            self._new_stream_notifications.put_nowait(frame.stream_id)
+
+    def _decode_agp1_packet(self, raw: bytes) -> tuple[list[bytes], list[int]]:
         """
-        Декодирует пакет формата AGP1.
+        Декодирует пакет формата AGP1 с учётом reorder buffer.
 
         Returns:
-            (seq, ack_seqs, logical_payloads)
-            logical_payloads — список готовых logical payload для обработки.
-            Для дубликатов payload пустой, но ACK всё равно шлётся.
+            (logical_payloads, ack_seqs)
+            logical_payloads — список готовых logical payload в правильном порядке.
+            ack_seqs — список seq которые нужно подтвердить отправителю.
         """
         if not raw.startswith(_PACKET_MAGIC):
             raise ValueError("not an AGP1 packet")
 
         seq, ack_seqs, payload = _parse_packet(raw)
 
-        logical_payloads: list[bytes] = []
-
         if seq == 0:
             # ACK-only пакет, данных нет
-            pass
-        elif seq in self._received_seqs_set:
+            return [], ack_seqs
+
+        if seq in self._received_seqs_set:
             # Дубликат: payload не обрабатываем, но ACK шлём
             self._logger.debug(f"Duplicate packet seq={seq}, sending ACK again")
             self._pending_acks.put_nowait(seq)
             self._has_pending_acks.set()
-        else:
-            # Новый пакет: добавляем в deque (старый seq вытесняется автоматически)
-            evicted = (
-                self._received_seqs[0]
-                if len(self._received_seqs) == self._received_seqs.maxlen
-                else None
-            )
-            self._received_seqs.append(seq)
-            self._received_seqs_set.add(seq)
-            if evicted is not None:
-                self._received_seqs_set.discard(evicted)
-            self._pending_acks.put_nowait(seq)
-            self._has_pending_acks.set()
-            if payload:
-                logical_payloads.append(payload)
+            return [], ack_seqs
 
-        return seq, ack_seqs, logical_payloads
+        # Новый пакет — регистрируем в deque дедупликации
+        evicted = (
+            self._received_seqs[0]
+            if len(self._received_seqs) == self._received_seqs.maxlen
+            else None
+        )
+        self._received_seqs.append(seq)
+        self._received_seqs_set.add(seq)
+        if evicted is not None:
+            self._received_seqs_set.discard(evicted)
+
+        # ACK шлём сразу — отправитель может убрать из in_flight
+        self._pending_acks.put_nowait(seq)
+        self._has_pending_acks.set()
+
+        # --- reorder buffer ---
+        # В STOP_AND_WAIT window=1, out-of-order невозможен — идём напрямую.
+        if self._reliability_mode == ReliabilityMode.STOP_AND_WAIT:
+            return ([payload] if payload else []), ack_seqs
+
+        # PARALLEL: кладём в буфер и флашим всё что уже можно отдать по порядку.
+        if payload:
+            self._reorder_buffer[seq] = (payload, time.monotonic())
+            self._logger.debug(
+                f"Reorder buffer: seq={seq}, next_expected={self._next_expected_seq}, "
+                f"buffered={sorted(self._reorder_buffer)}"
+            )
+
+        logical_payloads = self._flush_reorder_buffer()
+        return logical_payloads, ack_seqs
+
+    def _flush_reorder_buffer(self) -> list[bytes]:
+        """
+        Извлекает из reorder buffer все последовательные батчи начиная
+        с next_expected_seq и возвращает их в правильном порядке.
+        """
+        result: list[bytes] = []
+        while self._next_expected_seq in self._reorder_buffer:
+            payload, _ = self._reorder_buffer.pop(self._next_expected_seq)
+            self._logger.debug(f"Reorder buffer flush: seq={self._next_expected_seq}")
+            result.append(payload)
+            self._next_expected_seq += 1
+        return result
+
+    def _cleanup_stale_reorder_buffer(self) -> None:
+        """
+        Удаляет записи из reorder buffer которые ждут слишком долго.
+
+        На практике не должно срабатывать — ретрансмит бесконечный.
+        Защита от крайнего случая когда соединение закрылось в середине.
+        """
+        if not self._reorder_buffer:
+            return
+
+        now = time.monotonic()
+        stale = [
+            seq for seq, (_, arrival) in self._reorder_buffer.items()
+            if now - arrival > self._reorder_buffer_ttl
+        ]
+        for seq in stale:
+            self._logger.warning(f"Dropping stale reorder buffer entry: seq={seq}")
+            del self._reorder_buffer[seq]
+
+        # Если удалили seq который блокировал flush — продвигаем next_expected_seq
+        # чтобы не застрять навсегда. Пропускаем до следующего имеющегося или +1.
+        if stale and self._next_expected_seq in [s for s in stale]:
+            if self._reorder_buffer:
+                self._next_expected_seq = min(self._reorder_buffer)
+            else:
+                self._next_expected_seq = max(stale) + 1
 
     def _process_incoming_acks(self, ack_seqs: list[int]) -> None:
         """
@@ -580,7 +643,6 @@ class AggregatingLink:
     async def _writer_loop(self) -> None:
         try:
             while not self._stop_event.is_set():
-                # Берём первый frame
                 if self._pending_outgoing is not None:
                     first = self._pending_outgoing
                     self._pending_outgoing = None
@@ -617,7 +679,6 @@ class AggregatingLink:
                         await self._send_legacy(logical_payload)
                     else:
                         await self._send_reliable(logical_payload)
-
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -637,7 +698,6 @@ class AggregatingLink:
         кладёт в in_flight и шлёт физически.
         Повторная отправка при таймауте — в _retransmit_loop.
         """
-        # Ждём свободного слота в окне
         await self._window_semaphore.acquire()
 
         if self._stop_event.is_set():
@@ -647,9 +707,7 @@ class AggregatingLink:
         seq = self._seq_counter
         self._seq_counter += 1
 
-        # Piggyback: забираем все накопленные ACK
         ack_seqs = self._drain_pending_acks()
-
         packet = _build_packet(seq, ack_seqs, logical_payload)
 
         now = time.monotonic()
@@ -692,7 +750,7 @@ class AggregatingLink:
         """
         Фоновая задача: каждые ~50мс проверяет in_flight.
         Если пакет не получил ACK за delay_before_resending секунд — шлёт снова.
-        Цикл бесконечный: повторяет пока ACK не придёт (сколько бы раз ни терялся).
+        Цикл бесконечный: повторяет пока ACK не придёт.
         """
         try:
             while not self._stop_event.is_set():
@@ -702,28 +760,22 @@ class AggregatingLink:
                     continue
 
                 now = time.monotonic()
-                # Копируем список чтобы не итерироваться по изменяемому dict
                 to_retransmit = [
-                    pkt
-                    for pkt in self._in_flight.values()
+                    pkt for pkt in self._in_flight.values()
                     if now - pkt.last_send_time >= self._delay_before_resending
                 ]
 
                 for pkt in to_retransmit:
                     if pkt.seq not in self._in_flight:
-                        # ACK пришёл пока мы готовили список
                         continue
 
                     self._logger.warning(
                         f"Retransmitting seq={pkt.seq}, "
-                        f"age={now - pkt.first_send_time:.2f}s, "
-                        f"attempts since last send={now - pkt.last_send_time:.2f}s"
+                        f"age={now - pkt.first_send_time:.2f}s"
                     )
 
-                    # Piggyback накопленные ACK и в ретрансмит тоже
                     ack_seqs = self._drain_pending_acks()
                     if ack_seqs:
-                        # Перестраиваем пакет с новыми ACK
                         seq, _, payload = _parse_packet(pkt.packet_bytes)
                         new_packet = _build_packet(seq, ack_seqs, payload)
                         pkt.packet_bytes = new_packet
@@ -748,17 +800,11 @@ class AggregatingLink:
         Агрегирует pending ACK и отправляет их либо по таймеру,
         либо когда накопилось ack_batch_size штук.
 
-        Если в момент flush есть исходящие данные — writer сам
-        сделает piggyback при следующей отправке. Здесь шлём
-        ACK-only пакет только когда данных нет.
-
-        Примечание: piggyback в writer/_retransmit_loop уже забирает
-        ACK через _drain_pending_acks(). Этот loop — страховка для
-        случая когда исходящих данных долго нет.
+        Страховка на случай когда исходящих данных долго нет и piggyback
+        не происходит. Дублирующие ACK на другой стороне игнорируются.
         """
         try:
             while not self._stop_event.is_set():
-                # Ждём либо таймера, либо сигнала о новых ACK
                 try:
                     await asyncio.wait_for(
                         self._has_pending_acks.wait(),
@@ -771,10 +817,6 @@ class AggregatingLink:
                     self._has_pending_acks.clear()
                     continue
 
-                # Проверяем: если writer вот-вот отправит данные и сделает
-                # piggyback — ждать не нужно, но мы не знаем наверняка.
-                # Поэтому просто шлём ACK-only пакет. Дублирующий ACK
-                # на другой стороне просто проигнорируется (уже удалён из in_flight).
                 ack_seqs = self._drain_pending_acks()
                 if not ack_seqs:
                     self._has_pending_acks.clear()
@@ -787,7 +829,6 @@ class AggregatingLink:
                     await self._send_physical_packet(packet)
                 except Exception:
                     self._logger.exception("Failed to send ACK-only packet")
-                    # Возвращаем ACK обратно чтобы не потерять
                     for s in ack_seqs:
                         self._pending_acks.put_nowait(s)
                     self._has_pending_acks.set()
@@ -803,9 +844,7 @@ class AggregatingLink:
     # ------------------------------------------------------------------
 
     def _drain_pending_acks(self) -> list[int]:
-        """
-        Забирает до ack_batch_size ACK из очереди не блокируясь.
-        """
+        """Забирает до ack_batch_size ACK из очереди не блокируясь."""
         acks: list[int] = []
         while len(acks) < self._ack_batch_size:
             try:
@@ -815,9 +854,7 @@ class AggregatingLink:
         return acks
 
     async def _send_physical_packet(self, packet: bytes) -> None:
-        """
-        Отправляет ОДИН physical packet строго соблюдая min_send_interval.
-        """
+        """Отправляет ОДИН physical packet строго соблюдая min_send_interval."""
         now = time.monotonic()
         wait_more = self._min_send_interval - (now - self._last_send_ts)
         if wait_more > 0:
@@ -845,7 +882,7 @@ class AggregatingLink:
         packets: list[bytes] = []
         for part_index in range(total_parts):
             start = part_index * chunk_payload_limit
-            chunk_data = logical_payload[start : start + chunk_payload_limit]
+            chunk_data = logical_payload[start: start + chunk_payload_limit]
             packet = (
                 self.CHUNK_MAGIC
                 + self._CHUNK_META_STRUCT.pack(msg_id, part_index, total_parts)
@@ -857,7 +894,7 @@ class AggregatingLink:
 
     def _decode_legacy_transport_packet(self, raw_packet: bytes) -> list[bytes]:
         if raw_packet.startswith(self.SINGLE_MAGIC):
-            return [raw_packet[len(self.SINGLE_MAGIC) :]]
+            return [raw_packet[len(self.SINGLE_MAGIC):]]
 
         if raw_packet.startswith(self.CHUNK_MAGIC):
             header_start = len(self.CHUNK_MAGIC)
@@ -900,18 +937,15 @@ class AggregatingLink:
             return
         now = time.monotonic()
         stale_ids = [
-            msg_id
-            for msg_id, assembly in self._chunk_assemblies.items()
+            msg_id for msg_id, assembly in self._chunk_assemblies.items()
             if now - assembly.created_at > self._chunk_assembly_ttl
         ]
         for msg_id in stale_ids:
-            self._logger.warning(
-                f"Dropping stale chunk assembly: msg_id={msg_id.hex()}"
-            )
+            self._logger.warning(f"Dropping stale chunk assembly: msg_id={msg_id.hex()}")
             del self._chunk_assemblies[msg_id]
 
     # ------------------------------------------------------------------
-    # Batch encoding / decoding (без изменений)
+    # Batch encoding / decoding
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -955,14 +989,12 @@ class AggregatingLink:
             if not isinstance(payload, (bytes, bytearray)):
                 raise ValueError("payload must be bytes")
 
-            frames.append(
-                Frame(
-                    stream_id=stream_id,
-                    frame_type=frame_type,
-                    payload=bytes(payload),
-                    end=end,
-                )
-            )
+            frames.append(Frame(
+                stream_id=stream_id,
+                frame_type=frame_type,
+                payload=bytes(payload),
+                end=end,
+            ))
 
         return frames
 
