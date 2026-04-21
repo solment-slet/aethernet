@@ -8,10 +8,11 @@ import logging
 import httpx
 import websockets
 
-from aethernet.transport import LowTransport, AggregatingLink, get_transport
+from aethernet.transport.stack import get_transport
+from aethernet.transport.enums import EncryptionMode, ReliabilityMode
+from aethernet.transport import LowTransport, AggregatingLink
 from aethernet.typing import LoggerLike
-from aethernet.transport._utils import encode_json_bytes, decode_json_bytes
-from aethernet.typing import Bytes32
+from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
 
 
 class ServerRouter:
@@ -332,16 +333,25 @@ class AethernetServer(ServerRouter):
         cls,
         low_transport: LowTransport,
         *,
-        # Transport
-        encryption_key: Bytes32,
+        # Encryption
+        encryption_mode: EncryptionMode = EncryptionMode.NONE,
+        encryption_key: bytes | None = None,
+        # Aggregating
         flush_interval: float = 0.5,
         max_batch_size: int = 64 * 1024,
         chunk_assembly_ttl: float = 60.0,
+        # Reliability
+        reliability_mode: ReliabilityMode = ReliabilityMode.NONE,
+        window_size: int = 8,
+        ack_flush_interval: float = 0.1,
+        ack_batch_size: int = 8,
+        received_seqs_window: int = 256,
         # Server Router
         http_client: httpx.AsyncClient = httpx.AsyncClient(
             timeout=None, trust_env=False
         ),
         proxy_http_client: httpx.AsyncClient = httpx.AsyncClient(timeout=None),
+        # HTTP Aggregating
         sse_flush_bytes: int = 65536,
         sse_flush_interval: float = 0.5,
         # Logging
@@ -349,9 +359,15 @@ class AethernetServer(ServerRouter):
     ) -> AethernetServer:
         transport = await get_transport(
             low_transport,
+            encryption_mode=encryption_mode,
             encryption_key=encryption_key,
             flush_interval=flush_interval,
             max_batch_size=max_batch_size,
+            reliability_mode=reliability_mode,
+            window_size=window_size,
+            ack_flush_interval=ack_flush_interval,
+            ack_batch_size=ack_batch_size,
+            received_seqs_window=received_seqs_window,
             chunk_assembly_ttl=chunk_assembly_ttl,
             logger=logger,
         )

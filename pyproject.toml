@@ -1,12 +1,12 @@
 [project]
 name = "aethernet-core"
-version = "1.0.1"
+version = "2.0.0rc1"
 description = "Full HTTP and WebSocket traffic over any text-based transport — messengers, SMS, or anything else that can carry a string."
 authors = [
     { name = "Walter Kerrigan", email = "esolment@gmail.com" },
 ]
 readme = "README.md"
-requires-python = ">=3.12, <3.14"
+requires-python = ">=3.12,<3.14"
 license = { file = "LICENSE" }
 dependencies = [
     "basex-python==0.1.0",

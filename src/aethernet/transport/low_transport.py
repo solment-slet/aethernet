@@ -1,49 +1,63 @@
+from typing import Literal
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class LowTransportConfig:
+    mode: Literal["string", "bytes"] = "bytes"
+    max_message_bytes: int = 1024  # for string mode, calculated automatically
+    max_message_chars: int | None = None  # for string mode
+    alphabet: str | None = None  # chars for encoding in string mode
+    # Timings
+    min_send_interval: float = 0.2
+    min_recv_interval: float = 0.2
+    delay_before_resending: float = 8.0  # for reliable mode
 
 
 class LowTransport(ABC):
     """
-    Abstract base class for low-level text message transport.
+    Abstract base class for low-level text or byte message transport.
 
-    Defines the interface for sending and receiving text messages
+    Defines the interface for sending and receiving text or byte messages
     over an underlying channel (e.g. serial port, socket, BLE, etc.).
 
-    Subclasses must implement: __init__, close, send, recv.
+    Subclasses must implement: send, recv
+    optional: _setup, close, CONFIG_CLASS (attribute) and any of your other methods.
 
     Constraints enforced by the transport layer:
     - Outgoing messages must not exceed `max_message_chars` characters.
-    - Outgoing messages must consist solely of characters in `alphabet`.
+    - Outgoing messages must consist solely of characters in `alphabet` (in string mode).
     - Calls to send() must be spaced at least `min_send_interval` seconds apart.
     - Calls to recv() must be spaced at least `min_recv_interval` seconds apart.
     """
 
-    @abstractmethod
-    def __init__(self) -> None:
+    CONFIG: LowTransportConfig | type[LowTransportConfig] = LowTransportConfig
+
+    # ------------------------------------------------------------------ #
+    #  Initialization                                                    #
+    # ------------------------------------------------------------------ #
+
+    def __init__(
+        self,
+        config: LowTransportConfig | None = None,
+    ) -> None:
         """
-        Initialize transport configuration.
+        Subclass example:
 
-        Subclasses must call super().__init__() and may override
-        any of the attributes below to suit their channel.
+            def __init__(self, port: str, config: LowTransportConfig | None = None):
+                super().__init__(config)
+                self.port = port
         """
-        # Maximum number of characters allowed in a single outgoing message.
-        self.max_message_chars: int = 1000
-
-        # Characters permitted in outgoing messages (Base64 alphabet + '=').
-        self.alphabet: str = (
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
-        )
-
-        # Minimum time (seconds) that must elapse between consecutive send() calls.
-        self.min_send_interval: float = 0.2
-
-        # Minimum time (seconds) that must elapse between consecutive recv() calls.
-        self.min_recv_interval: float = 0.2
+        if config is None:
+            cfg = self.CONFIG
+            config = cfg() if isinstance(cfg, type) else cfg
+        self.config = config
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                         #
     # ------------------------------------------------------------------ #
 
-    @abstractmethod
     def close(self) -> None:
         """Release all resources held by the transport (connections, file handles, etc.)."""
 
@@ -52,23 +66,23 @@ class LowTransport(ABC):
     # ------------------------------------------------------------------ #
 
     @abstractmethod
-    def send(self, text: str) -> None:
+    def send(self, data: str | bytes) -> None:
         """
-        Send a text message over the transport.
+        Send a text or byte message over the transport.
 
-        The caller guarantees that *text* satisfies all constraints
-        (length <= max_message_chars, characters within alphabet),
+        The caller guarantees that *data* satisfies all constraints
+        (len(data) <= max_message_chars or max_message_bytes),
         so implementations do not need to validate the input.
 
         Args:
-            text: The message to send.
+            data: The data to send.
         """
 
     @abstractmethod
-    def recv(self) -> str:
+    def recv(self) -> str | bytes:
         """
-        Receive a text message from the transport.
+        Receive a text or byte message from the transport.
 
         Returns:
-            The received message as a string.
+            The received message as a string or bytes.
         """

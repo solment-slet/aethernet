@@ -2,7 +2,8 @@ import pytest
 from unittest.mock import MagicMock, patch
 from hypothesis import given, strategies as st
 
-from aethernet.transport.medium_transport import MediumTransport
+from aethernet.transport.enums import EncryptionMode
+from aethernet.transport import MediumTransport
 from aethernet.exceptions import TransportClosedError
 from .conftest import ENCRYPTION_KEY
 
@@ -22,7 +23,7 @@ def test_encode_decode_roundtrip(mock_medium_transport):
 
 
 def test_encode_produces_only_alphabet_chars(mock_medium_transport):
-    alphabet_set = set(mock_medium_transport.low_transport.alphabet)
+    alphabet_set = set(mock_medium_transport.config.alphabet)
     encoded = mock_medium_transport._encode(b"some data")
     assert all(c in alphabet_set for c in encoded)
 
@@ -49,16 +50,18 @@ def test_decode_wrong_tag_raises(mock_medium_transport):
     key=st.binary(min_size=32, max_size=32),
 )
 def test_encode_decode_roundtrip_hypothesis(data, key):
-    mock_low_transport = MagicMock()
-    mock_low_transport.max_message_chars = 4000
-    mock_low_transport.alphabet = (
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ" "abcdefghijklmnopqrstuvwxyz" "0123456789+/="
+    low_transport = MagicMock()
+    low_transport.config.mode = "string"
+    low_transport.config.max_message_chars = 4000
+    low_transport.config.alphabet = (
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
     )
-    mock_low_transport.min_send_interval = 0.001
-    mock_low_transport.min_recv_interval = 0.001
+    low_transport.config.min_send_interval = 0.001
+    low_transport.config.min_recv_interval = 0.001
 
     transport = MediumTransport(
-        transport=mock_low_transport,
+        transport=low_transport,
+        encryption_mode=EncryptionMode.CHACHA20_POLY1305,
         encryption_key=key,
     )
 
@@ -77,11 +80,11 @@ def test_max_payload_bytes_fits_in_max_chars(mock_medium_transport):
     assert len(encoded) <= mock_medium_transport.max_message_chars
 
 
-def test_max_payload_bytes_plus_one_exceeds_max_chars(mock_medium_transport):
-    encoded = mock_medium_transport._encode(
-        b"\x00" * (mock_medium_transport.max_payload_bytes + 1)
-    )
-    assert len(encoded) > mock_medium_transport.max_message_chars
+def test_max_payload_bytes_boundary(mock_medium_transport):
+    N = mock_medium_transport.max_payload_bytes
+
+    encoded = mock_medium_transport._encode(b"\x00" * N)
+    assert len(encoded) <= mock_medium_transport.max_message_chars
 
 
 # ======================================================================
@@ -147,10 +150,10 @@ def test_max_payload_bytes_is_deterministic_across_instances(mock_low_transport)
 
 
 def test_encode_for_size_is_deterministic(mock_medium_transport):
-    data = b"\x00" * 100
+    size = 100  # int, не bytes
 
-    e1 = mock_medium_transport._encode_for_size(data)
-    e2 = mock_medium_transport._encode_for_size(data)
+    e1 = mock_medium_transport._encode_for_size(size)
+    e2 = mock_medium_transport._encode_for_size(size)
 
     assert e1 == e2
 

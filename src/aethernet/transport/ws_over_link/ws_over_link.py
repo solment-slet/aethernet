@@ -14,7 +14,7 @@ from websockets.http11 import Response
 from websockets.datastructures import Headers
 
 from aethernet.transport import AggregatingLink
-from aethernet.transport._utils import encode_json_bytes, decode_json_bytes
+from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
 
 HeadersLike = Any
 

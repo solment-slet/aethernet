@@ -8,7 +8,7 @@ from aethernet.transport.ws_over_link.ws_over_link import (
     _normalize_headers,
     _make_connection_closed,
 )
-from aethernet.transport._utils import (
+from aethernet.transport.utils import (
     encode_json_bytes,
     decode_json_bytes,
 )

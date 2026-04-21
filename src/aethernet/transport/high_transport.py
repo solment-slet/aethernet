@@ -6,11 +6,14 @@ import struct
 import time
 import uuid
 import logging
+from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, AsyncIterator
 
 import msgpack
 
+from aethernet.transport.enums import ReliabilityMode
+from aethernet.exceptions import StreamClosed
 from aethernet.typing import LoggerLike
 from aethernet.transport.medium_transport import MediumTransport
 
@@ -37,10 +40,9 @@ class Frame:
     end: bool = False
 
 
-class StreamClosed(Exception):
-    """Исключение, возникающее при закрытии link во время ожидания frame."""
-
-    pass
+# ---------------------------------------------------------------------------
+# Internal data types
+# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -59,6 +61,97 @@ class _ChunkAssembly:
     created_at: float
 
 
+@dataclass(slots=True)
+class _InFlightPacket:
+    """
+    Пакет, отправленный, но ещё не подтверждённый получателем.
+
+    Attributes:
+        seq: Порядковый номер пакета.
+        packet_bytes: Готовые байты для повторной отправки.
+        first_send_time: Время первой отправки (для метрик/логов).
+        last_send_time: Время последней отправки (для retransmit таймера).
+    """
+
+    seq: int
+    packet_bytes: bytes
+    first_send_time: float
+    last_send_time: float
+
+
+# ---------------------------------------------------------------------------
+# Packet header layout
+#
+# Единый формат физического пакета (заменяет SINGLE_MAGIC / CHUNK_MAGIC):
+#
+#   PACKET_MAGIC (4 bytes)
+#   + _PACKET_HEADER_STRUCT:
+#       seq        uint32   порядковый номер (0 = ACK-only, нет данных)
+#       ack_count  uint8    количество ACK в списке
+#   + ack_seqs: uint32 * ack_count   — SACK список
+#   + payload: bytes                 — msgpack batch (может быть пустым)
+#
+# Режим NONE использует старые SINGLE/CHUNK форматы без изменений.
+# ---------------------------------------------------------------------------
+
+_PACKET_MAGIC = b"AGP1"
+_PACKET_HEADER_STRUCT = struct.Struct(">IB")  # seq: uint32, ack_count: uint8
+_ACK_SEQ_STRUCT = struct.Struct(">I")  # один ack_seq: uint32
+
+# Заголовок без ACK и без payload
+_MIN_PACKET_HEADER_SIZE = len(_PACKET_MAGIC) + _PACKET_HEADER_STRUCT.size
+
+
+def _build_packet(
+    seq: int,
+    ack_seqs: list[int],
+    payload: bytes,
+) -> bytes:
+    """Собирает физический пакет нового формата AGP1."""
+    ack_count = len(ack_seqs)
+    header = _PACKET_MAGIC + _PACKET_HEADER_STRUCT.pack(seq, ack_count)
+    acks = b"".join(_ACK_SEQ_STRUCT.pack(s) for s in ack_seqs)
+    return header + acks + payload
+
+
+def _parse_packet(raw: bytes) -> tuple[int, list[int], bytes]:
+    """
+    Разбирает физический пакет нового формата AGP1.
+
+    Returns:
+        (seq, ack_seqs, payload)
+
+    Raises:
+        ValueError: Если пакет повреждён.
+    """
+    if not raw.startswith(_PACKET_MAGIC):
+        raise ValueError(f"unknown packet magic: {raw[:4]!r}")
+
+    min_size = _MIN_PACKET_HEADER_SIZE
+    if len(raw) < min_size:
+        raise ValueError("packet too short")
+
+    offset = len(_PACKET_MAGIC)
+    seq, ack_count = _PACKET_HEADER_STRUCT.unpack_from(raw, offset)
+    offset += _PACKET_HEADER_STRUCT.size
+
+    ack_seqs: list[int] = []
+    for _ in range(ack_count):
+        if offset + _ACK_SEQ_STRUCT.size > len(raw):
+            raise ValueError("packet truncated in ack list")
+        (ack_seq,) = _ACK_SEQ_STRUCT.unpack_from(raw, offset)
+        offset += _ACK_SEQ_STRUCT.size
+        ack_seqs.append(ack_seq)
+
+    payload = raw[offset:]
+    return seq, ack_seqs, payload
+
+
+# ---------------------------------------------------------------------------
+# AggregatingLink
+# ---------------------------------------------------------------------------
+
+
 class AggregatingLink:
     """
     Надстройка над синхронным капризным Transport.
@@ -69,34 +162,35 @@ class AggregatingLink:
     - маршрутизация входящих frame по stream_id
     - если logical batch слишком большой для Transport, он режется на transport chunks
 
-    ВАЖНО:
-    - min_send_interval соблюдается между ЛЮБЫМИ physical send(), включая chunk-пакеты
-    - transport.max_payload_bytes, если есть, считается абсолютным лимитом payload для одного send()
+    Режимы надёжности (ReliabilityMode):
+    - NONE          — без подтверждений (оригинальное поведение)
+    - STOP_AND_WAIT — Stop-and-Wait ARQ (window_size=1)
+    - PARALLEL      — Selective-Repeat ARQ с окном window_size > 1
 
-    Формат logical batch:
-        msgpack.packb(
-            [
-                {"s": stream_id, "t": frame_type, "p": payload, "e": end},
-                ...
-            ],
-            use_bin_type=True
-        )
+    При STOP_AND_WAIT и PARALLEL:
+    - каждый physical send получает порядковый номер seq
+    - получатель шлёт SACK (список подтверждённых seq)
+    - отправитель повторяет пакеты из in_flight каждые delay_before_resending секунд
+      пока не получит ACK; цикл бесконечный — ACK может теряться много раз
+    - получатель при дубликате всё равно шлёт ACK (не обрабатывает payload повторно)
+    - ACK агрегируются и отправляются либо piggyback с данными,
+      либо отдельным ACK-only пакетом
 
-    Формат transport packet:
-        1) single:
-            b"AGS1" + logical_payload
+    Формат нового физического пакета (режимы STOP_AND_WAIT / PARALLEL):
+        AGP1
+        + struct(">IB"): seq (uint32), ack_count (uint8)
+        + uint32 * ack_count  (SACK список)
+        + payload bytes       (msgpack batch, может быть пустым)
 
-        2) chunk:
-            b"AGC1" + struct.pack(">16sHH", msg_id, part_index, total_parts) + chunk_data
+    Старые форматы (режим NONE):
+        AGS1 + logical_payload         (single)
+        AGC1 + chunk_meta + chunk_data (chunk)
     """
 
+    # --- старые magic (режим NONE) ---
     SINGLE_MAGIC = b"AGS1"
     CHUNK_MAGIC = b"AGC1"
-
-    # 16 bytes  - msg_id
-    # 2 bytes   - part_index
-    # 2 bytes   - total_parts
-    _CHUNK_META_STRUCT = struct.Struct(">16sHH")
+    _CHUNK_META_STRUCT = struct.Struct(">16sHH")  # msg_id, part_index, total_parts
 
     def __init__(
         self,
@@ -106,26 +200,46 @@ class AggregatingLink:
         flush_interval: float = 0.5,
         max_batch_size: int = 64 * 1024,
         chunk_assembly_ttl: float = 60.0,
+        # --- reliability ---
+        reliability_mode: ReliabilityMode = ReliabilityMode.NONE,
+        window_size: int = 8,
+        ack_flush_interval: float = 0.1,
+        ack_batch_size: int = 8,
+        received_seqs_window: int = 256,  # window_size * 4. Default: 256
     ) -> None:
         """
         Args:
             transport: Синхронный низкоуровневый транспорт.
-            flush_interval: Максимальное время ожидания перед отправкой батча.
-            max_batch_size: Максимальный размер logical batch в байтах.
-            chunk_assembly_ttl: Время жизни незавершённой сборки chunk-пакетов.
+            flush_interval: Maximum waiting time before sending a batch.
+            max_batch_size: Maximum logical batch size in bytes.
+            chunk_assembly_ttl: Lifetime of an incomplete chunk assembly.
+            reliability_mode: Delivery reliability mode.
+            window_size: Window size for PARALLEL mode.
+            ack_flush_interval: Maximum ACK accumulation time before sending.
+            ack_batch_size: Maximum number of ACKs in a single flush.
+            received_seqs_window: How many recent seqs to store for deduplication.
         """
         self._logger = logger
         self._transport = transport
+        self._config = self._transport.config
 
         self._flush_interval = flush_interval
-        self._min_send_interval = self._transport.low_transport.min_send_interval
-        self._recv_restart_delay = self._transport.low_transport.min_recv_interval
         self._chunk_assembly_ttl = chunk_assembly_ttl
+        self._min_send_interval = self._config.min_send_interval
+        self._recv_restart_delay = self._config.min_recv_interval
+        self._delay_before_resending = self._config.delay_before_resending
+
+        # --- reliability config ---
+        self._reliability_mode = reliability_mode
+        self._window_size = (
+            1 if reliability_mode == ReliabilityMode.STOP_AND_WAIT else window_size
+        )
+        self._ack_flush_interval = ack_flush_interval
+        self._ack_batch_size = ack_batch_size
+        self._received_seqs_window = received_seqs_window
 
         self._shutdown_task = asyncio.create_task(self._shutdown_watcher())
 
-        # Если transport знает свой лимит полезной нагрузки для одного send(),
-        # используем его для transport-level framing.
         self._transport_limit: int = self._transport.max_payload_bytes
 
         self._single_packet_payload_limit = self._transport_limit - len(
@@ -134,62 +248,81 @@ class AggregatingLink:
         self._chunk_packet_payload_limit = (
             self._transport_limit - len(self.CHUNK_MAGIC) - self._CHUNK_META_STRUCT.size
         )
+        # payload limit для нового AGP1 формата (без ACK — их добавим позже при необходимости)
+        self._agp1_payload_limit = self._transport_limit - _MIN_PACKET_HEADER_SIZE
 
         if self._single_packet_payload_limit <= 0:
             raise ValueError(
                 "transport.max_payload_bytes too small for SINGLE packet framing"
             )
-
         if self._chunk_packet_payload_limit <= 0:
             raise ValueError(
                 "transport.max_payload_bytes too small for CHUNK packet framing"
             )
+        if self._agp1_payload_limit <= 0:
+            raise ValueError(
+                "transport.max_payload_bytes too small for AGP1 packet framing"
+            )
 
-        # Чтобы writer loop по умолчанию старался укладываться в один physical packet,
-        # автоматически сужаем max_batch_size до single packet payload limit.
         self._max_batch_size = min(max_batch_size, self._single_packet_payload_limit)
 
-        # Очередь исходящих logical frame.
+        # --- outgoing / incoming queues ---
         self._outgoing: asyncio.Queue[Frame] = asyncio.Queue()
-
-        # Входящие logical frame по stream_id.
         self._incoming_by_stream: dict[str, asyncio.Queue[Frame]] = {}
-
-        # Уведомления о появлении нового stream_id.
         self._new_stream_notifications: asyncio.Queue[str] = asyncio.Queue()
         self._seen_incoming_streams: set[str] = set()
-
-        # Один frame, который не влез в предыдущий batch.
-        # Важно для сохранения строгого порядка без возврата в конец очереди.
         self._pending_outgoing: Frame | None = None
 
-        # Буфера для сборки chunk-пакетов.
+        # --- chunk assembly (режим NONE) ---
         self._chunk_assemblies: dict[bytes, _ChunkAssembly] = {}
 
-        # Reader/writer tasks.
+        # --- reliability: sender side ---
+        # Пакеты в полёте: seq → _InFlightPacket
+        self._in_flight: dict[int, _InFlightPacket] = {}
+        # Счётчик seq (начинаем с 1, 0 зарезервирован для ACK-only)
+        self._seq_counter: int = 1
+        # Семафор ограничивает количество одновременно летящих пакетов
+        self._window_semaphore: asyncio.Semaphore = asyncio.Semaphore(self._window_size)
+        # Событие: пришёл новый ACK → retransmit loop может проснуться
+        self._ack_received_event: asyncio.Event = asyncio.Event()
+
+        # --- reliability: receiver side ---
+        # Скользящее окно последних received_seqs_window seq для дедупликации.
+        # deque с maxlen автоматически вытесняет старые записи — нет утечки памяти.
+        self._received_seqs: deque[int] = deque(maxlen=self._received_seqs_window)
+        # set-представление для O(1) проверки вхождения
+        self._received_seqs_set: set[int] = set()
+        # Очередь seq ожидающих отправки ACK
+        self._pending_acks: asyncio.Queue[int] = asyncio.Queue()
+        # Событие: есть ACK для отправки (будит ACK aggregator)
+        self._has_pending_acks: asyncio.Event = asyncio.Event()
+
+        # --- tasks ---
         self._reader_task: asyncio.Task[None] | None = None
         self._writer_task: asyncio.Task[None] | None = None
+        self._retransmit_task: asyncio.Task[None] | None = None
+        self._ack_sender_task: asyncio.Task[None] | None = None
 
-        # Lifecycle.
+        # --- lifecycle ---
         self._started = False
         self._closed = False
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
-
-        # Timestamp последнего physical send().
         self._last_send_ts = 0.0
 
         self._logger.info(
-            "AggregatingLink initialized: transport_limit={}, single_limit={}, chunk_limit={}, max_batch_size={}",
-            self._transport_limit,
-            self._single_packet_payload_limit,
-            self._chunk_packet_payload_limit,
-            self._max_batch_size,
+            f"AggregatingLink initialized: transport_limit={self._transport_limit}, "
+            f"reliability={reliability_mode.value}, window_size={self._window_size}, "
+            f"agp1_payload_limit={self._agp1_payload_limit}"
         )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
         """
-        Запускает reader и writer loop.
+        Запускает reader, writer и (если нужно) reliability tasks.
 
         Повторный вызов безопасен.
 
@@ -197,11 +330,10 @@ class AggregatingLink:
             RuntimeError: Если link уже закрыт.
         """
         async with self._lock:
-            if self._started:
-                return
-
             if self._closed:
                 raise RuntimeError("AggregatingLink is closed")
+            if self._started:
+                return
 
             self._started = True
             self._reader_task = asyncio.create_task(
@@ -211,6 +343,14 @@ class AggregatingLink:
                 self._writer_loop(), name="AggregatingLink.writer"
             )
 
+            if self._reliability_mode != ReliabilityMode.NONE:
+                self._retransmit_task = asyncio.create_task(
+                    self._retransmit_loop(), name="AggregatingLink.retransmit"
+                )
+                self._ack_sender_task = asyncio.create_task(
+                    self._ack_sender_loop(), name="AggregatingLink.ack_sender"
+                )
+
             self._logger.info("AggregatingLink started")
 
     async def close(self) -> None:
@@ -218,33 +358,36 @@ class AggregatingLink:
             if self._closed:
                 return
 
+            self._logger.info("Closing...")
             self._closed = True
             self._stop_event.set()
 
-            self._logger.info("Завершаем")
-            # Выполняем синхронный close в отдельном потоке
             await asyncio.to_thread(self._transport.low_transport.close)
-            self._logger.info("Завершено")
 
-            # Отменяем tasks
-            tasks = [t for t in (self._reader_task, self._writer_task) if t is not None]
+            tasks = [
+                t
+                for t in (
+                    self._reader_task,
+                    self._writer_task,
+                    self._retransmit_task,
+                    self._ack_sender_task,
+                )
+                if t is not None
+            ]
             for task in tasks:
                 task.cancel()
 
-        # Ждем завершения
         for task in tasks:
             try:
                 await task
             except asyncio.CancelledError:
                 pass
 
-    async def accept_stream(self) -> str:
-        """
-        Ожидает появления нового входящего stream_id.
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-        Returns:
-            Идентификатор нового стрима.
-        """
+    async def accept_stream(self) -> str:
         if not self._started:
             raise RuntimeError("AggregatingLink.start() must be called first")
         return await self._new_stream_notifications.get()
@@ -257,25 +400,10 @@ class AggregatingLink:
         *,
         end: bool = False,
     ) -> None:
-        """
-        Помещает logical frame в очередь на отправку.
-
-        Args:
-            stream_id: Идентификатор логического стрима.
-            frame_type: Тип фрейма.
-            payload: Полезная нагрузка.
-            end: Завершает стрим, если True.
-
-        Raises:
-            RuntimeError: Если link не запущен или уже закрыт.
-            TypeError: Если payload не bytes-like.
-        """
         if self._closed:
             raise RuntimeError("AggregatingLink is closed")
-
         if not self._started:
             raise RuntimeError("AggregatingLink.start() must be called first")
-
         if not isinstance(payload, (bytes, bytearray, memoryview)):
             raise TypeError("payload must be bytes-like")
 
@@ -288,19 +416,6 @@ class AggregatingLink:
         await self._outgoing.put(frame)
 
     async def recv_frame(self, stream_id: str) -> Frame:
-        """
-        Получает следующий входящий frame для указанного stream_id.
-
-        Args:
-            stream_id: Идентификатор стрима.
-
-        Returns:
-            Frame.
-
-        Raises:
-            RuntimeError: Если link не запущен.
-            StreamClosed: Если link закрылся во время ожидания.
-        """
         if not self._started:
             raise RuntimeError("AggregatingLink.start() must be called first")
 
@@ -312,12 +427,7 @@ class AggregatingLink:
 
         return frame
 
-    async def iter_stream(self, stream_id: str):
-        """
-        Асинхронный итератор по всем frame данного stream_id.
-
-        Завершается при получении frame с end=True.
-        """
+    async def iter_stream(self, stream_id: str) -> AsyncIterator[Frame]:
         while True:
             frame = await self.recv_frame(stream_id)
             yield frame
@@ -326,61 +436,60 @@ class AggregatingLink:
 
     @staticmethod
     def new_stream_id() -> str:
-        """
-        Генерирует новый уникальный stream_id.
-
-        Returns:
-            Строковый hex-идентификатор.
-        """
         return uuid.uuid4().hex
 
+    # ------------------------------------------------------------------
+    # Reader loop
+    # ------------------------------------------------------------------
+
     async def _reader_loop(self) -> None:
-        """
-        Постоянно читает physical packets из transport, при необходимости
-        собирает chunk-пакеты, декодирует logical batches и раскладывает
-        frame по stream-очередям.
-        """
         try:
             while not self._stop_event.is_set():
                 try:
                     raw_packet = await asyncio.to_thread(
                         self._transport.recv, self._recv_restart_delay
                     )
-
                     self._logger.debug(
-                        "AggregatingLink recv physical packet: size={}, prefix={}",
-                        len(raw_packet),
-                        raw_packet[:32].hex(),
+                        f"recv physical packet: size={len(raw_packet)}, "
+                        f"prefix={raw_packet[:32].hex()}"
                     )
-
                 except asyncio.CancelledError:
                     raise
-
                 except Exception:
                     self._logger.exception("Ошибка транспорта recv, продолжаем работу.")
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(self._recv_restart_delay)
                     continue
 
                 try:
-                    logical_payloads = self._decode_transport_packet(raw_packet)
+                    if self._reliability_mode == ReliabilityMode.NONE:
+                        logical_payloads = self._decode_legacy_transport_packet(
+                            raw_packet
+                        )
+                        ack_seqs_received: list[int] = []
+                    else:
+                        seq, ack_seqs_received, logical_payloads = (
+                            self._decode_agp1_packet(raw_packet)
+                        )
                 except Exception as e:
-                    self._logger.error("Получен битый transport packet: {}", e)
+                    self._logger.error(f"Получен битый transport packet: {e}")
                     continue
 
-                # Чистим подвисшие незавершенные chunk-сборки.
+                # --- обработка входящих ACK ---
+                if ack_seqs_received:
+                    self._process_incoming_acks(ack_seqs_received)
+
                 self._cleanup_stale_chunk_assemblies()
 
                 for logical_payload in logical_payloads:
                     try:
                         frames = self._decode_batch(logical_payload)
                     except Exception as e:
-                        self._logger.error("Получен битый logical batch: {}", e)
+                        self._logger.error(f"Получен битый logical batch: {e}")
                         continue
 
                     self._logger.debug(
-                        "Decoded logical batch: frames={}, payload_size={}",
-                        len(frames),
-                        len(logical_payload),
+                        f"Decoded logical batch: frames={len(frames)}, "
+                        f"payload_size={len(logical_payload)}"
                     )
 
                     for frame in frames:
@@ -401,22 +510,77 @@ class AggregatingLink:
                     await asyncio.sleep(self._recv_restart_delay)
 
         except asyncio.CancelledError:
-            self._logger.debug("AggregatingLink reader loop cancelled")
+            self._logger.debug("reader loop cancelled")
             raise
 
-    async def _writer_loop(self) -> None:
+    def _decode_agp1_packet(self, raw: bytes) -> tuple[int, list[int], list[bytes]]:
         """
-        Постоянно собирает logical frame в logical batches и отправляет их в transport.
+        Декодирует пакет формата AGP1.
 
-        ВАЖНО:
-        порядок frame сохраняется строго.
-        Если очередной frame не влезает в текущий batch, он НЕ возвращается
-        в asyncio.Queue, а сохраняется в self._pending_outgoing и будет обработан
-        первым на следующей итерации.
+        Returns:
+            (seq, ack_seqs, logical_payloads)
+            logical_payloads — список готовых logical payload для обработки.
+            Для дубликатов payload пустой, но ACK всё равно шлётся.
         """
+        if not raw.startswith(_PACKET_MAGIC):
+            raise ValueError("not an AGP1 packet")
+
+        seq, ack_seqs, payload = _parse_packet(raw)
+
+        logical_payloads: list[bytes] = []
+
+        if seq == 0:
+            # ACK-only пакет, данных нет
+            pass
+        elif seq in self._received_seqs_set:
+            # Дубликат: payload не обрабатываем, но ACK шлём
+            self._logger.debug(f"Duplicate packet seq={seq}, sending ACK again")
+            self._pending_acks.put_nowait(seq)
+            self._has_pending_acks.set()
+        else:
+            # Новый пакет: добавляем в deque (старый seq вытесняется автоматически)
+            evicted = (
+                self._received_seqs[0]
+                if len(self._received_seqs) == self._received_seqs.maxlen
+                else None
+            )
+            self._received_seqs.append(seq)
+            self._received_seqs_set.add(seq)
+            if evicted is not None:
+                self._received_seqs_set.discard(evicted)
+            self._pending_acks.put_nowait(seq)
+            self._has_pending_acks.set()
+            if payload:
+                logical_payloads.append(payload)
+
+        return seq, ack_seqs, logical_payloads
+
+    def _process_incoming_acks(self, ack_seqs: list[int]) -> None:
+        """
+        Обрабатывает входящие ACK: удаляет подтверждённые пакеты из in_flight
+        и освобождает слоты в window semaphore.
+        """
+        for ack_seq in ack_seqs:
+            if ack_seq in self._in_flight:
+                pkt = self._in_flight.pop(ack_seq)
+                rtt = time.monotonic() - pkt.first_send_time
+                self._logger.debug(
+                    f"ACK received for seq={ack_seq}, RTT={rtt:.3f}s, "
+                    f"in_flight={len(self._in_flight)}"
+                )
+                self._window_semaphore.release()
+                self._ack_received_event.set()
+            else:
+                self._logger.debug(f"ACK for unknown/already-acked seq={ack_seq}")
+
+    # ------------------------------------------------------------------
+    # Writer loop
+    # ------------------------------------------------------------------
+
+    async def _writer_loop(self) -> None:
         try:
             while not self._stop_event.is_set():
-                # Берем первый frame либо из pending, либо из основной очереди.
+                # Берём первый frame
                 if self._pending_outgoing is not None:
                     first = self._pending_outgoing
                     self._pending_outgoing = None
@@ -431,7 +595,6 @@ class AggregatingLink:
                     timeout = deadline - time.monotonic()
                     if timeout <= 0:
                         break
-
                     try:
                         next_frame = await asyncio.wait_for(
                             self._outgoing.get(), timeout=timeout
@@ -440,10 +603,7 @@ class AggregatingLink:
                         break
 
                     next_estimate = self._estimate_frame_size(next_frame)
-
                     if batch_size_estimate + next_estimate > self._max_batch_size:
-                        # ВАЖНО: не возвращаем frame в очередь, иначе он окажется
-                        # в конце и сломает порядок.
                         self._pending_outgoing = next_frame
                         break
 
@@ -451,95 +611,241 @@ class AggregatingLink:
                     batch_size_estimate += next_estimate
 
                 logical_payload = self._encode_batch(batch)
-                transport_packets = self._encode_transport_packets(logical_payload)
-
-                self._logger.debug(
-                    "Prepared batch: frames={}, est_size={}, logical_payload_size={}, transport_packets={}",
-                    len(batch),
-                    batch_size_estimate,
-                    len(logical_payload),
-                    len(transport_packets),
-                )
-
-                if len(transport_packets) > 1:
-                    self._logger.warning(
-                        "Logical payload split into {} transport packets (payload_size={}, transport_limit={})",
-                        len(transport_packets),
-                        len(logical_payload),
-                        self._transport_limit,
-                    )
 
                 try:
-                    for packet_index, packet in enumerate(transport_packets):
-                        self._logger.debug(
-                            "Sending physical packet {}/{}: size={}, prefix={}",
-                            packet_index + 1,
-                            len(transport_packets),
-                            len(packet),
-                            packet[:32].hex(),
-                        )
-                        await self._send_physical_packet(packet)
+                    if self._reliability_mode == ReliabilityMode.NONE:
+                        await self._send_legacy(logical_payload)
+                    else:
+                        await self._send_reliable(logical_payload)
 
                 except asyncio.CancelledError:
                     raise
-
                 except Exception:
                     self._logger.exception("Ошибка при отправке сообщения")
                     await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
-            self._logger.debug("AggregatingLink writer loop cancelled")
+            self._logger.debug("writer loop cancelled")
             raise
+
+    async def _send_reliable(self, logical_payload: bytes) -> None:
+        """
+        Отправляет logical payload в режиме ARQ.
+
+        Ждёт свободного слота в window (semaphore), назначает seq,
+        строит AGP1 пакет (piggyback любые накопленные ACK),
+        кладёт в in_flight и шлёт физически.
+        Повторная отправка при таймауте — в _retransmit_loop.
+        """
+        # Ждём свободного слота в окне
+        await self._window_semaphore.acquire()
+
+        if self._stop_event.is_set():
+            self._window_semaphore.release()
+            return
+
+        seq = self._seq_counter
+        self._seq_counter += 1
+
+        # Piggyback: забираем все накопленные ACK
+        ack_seqs = self._drain_pending_acks()
+
+        packet = _build_packet(seq, ack_seqs, logical_payload)
+
+        now = time.monotonic()
+        self._in_flight[seq] = _InFlightPacket(
+            seq=seq,
+            packet_bytes=packet,
+            first_send_time=now,
+            last_send_time=now,
+        )
+
+        self._logger.debug(
+            f"Sending reliable seq={seq}, payload={len(logical_payload)}b, "
+            f"piggybacked_acks={ack_seqs}, in_flight={len(self._in_flight)}"
+        )
+
+        await self._send_physical_packet(packet)
+
+    async def _send_legacy(self, logical_payload: bytes) -> None:
+        """Отправляет в старом формате AGS1/AGC1 (режим NONE)."""
+        transport_packets = self._encode_legacy_transport_packets(logical_payload)
+
+        if len(transport_packets) > 1:
+            self._logger.warning(
+                f"Logical payload split into {len(transport_packets)} transport packets "
+                f"(payload_size={len(logical_payload)}, transport_limit={self._transport_limit})"
+            )
+
+        for packet_index, packet in enumerate(transport_packets):
+            self._logger.debug(
+                f"Sending legacy packet {packet_index + 1}/{len(transport_packets)}: "
+                f"size={len(packet)}, prefix={packet[:32].hex()}"
+            )
+            await self._send_physical_packet(packet)
+
+    # ------------------------------------------------------------------
+    # Retransmit loop
+    # ------------------------------------------------------------------
+
+    async def _retransmit_loop(self) -> None:
+        """
+        Фоновая задача: каждые ~50мс проверяет in_flight.
+        Если пакет не получил ACK за delay_before_resending секунд — шлёт снова.
+        Цикл бесконечный: повторяет пока ACK не придёт (сколько бы раз ни терялся).
+        """
+        try:
+            while not self._stop_event.is_set():
+                await asyncio.sleep(0.05)
+
+                if not self._in_flight:
+                    continue
+
+                now = time.monotonic()
+                # Копируем список чтобы не итерироваться по изменяемому dict
+                to_retransmit = [
+                    pkt
+                    for pkt in self._in_flight.values()
+                    if now - pkt.last_send_time >= self._delay_before_resending
+                ]
+
+                for pkt in to_retransmit:
+                    if pkt.seq not in self._in_flight:
+                        # ACK пришёл пока мы готовили список
+                        continue
+
+                    self._logger.warning(
+                        f"Retransmitting seq={pkt.seq}, "
+                        f"age={now - pkt.first_send_time:.2f}s, "
+                        f"attempts since last send={now - pkt.last_send_time:.2f}s"
+                    )
+
+                    # Piggyback накопленные ACK и в ретрансмит тоже
+                    ack_seqs = self._drain_pending_acks()
+                    if ack_seqs:
+                        # Перестраиваем пакет с новыми ACK
+                        seq, _, payload = _parse_packet(pkt.packet_bytes)
+                        new_packet = _build_packet(seq, ack_seqs, payload)
+                        pkt.packet_bytes = new_packet
+
+                    pkt.last_send_time = time.monotonic()
+
+                    try:
+                        await self._send_physical_packet(pkt.packet_bytes)
+                    except Exception:
+                        self._logger.exception(f"Retransmit failed for seq={pkt.seq}")
+
+        except asyncio.CancelledError:
+            self._logger.debug("retransmit loop cancelled")
+            raise
+
+    # ------------------------------------------------------------------
+    # ACK sender loop
+    # ------------------------------------------------------------------
+
+    async def _ack_sender_loop(self) -> None:
+        """
+        Агрегирует pending ACK и отправляет их либо по таймеру,
+        либо когда накопилось ack_batch_size штук.
+
+        Если в момент flush есть исходящие данные — writer сам
+        сделает piggyback при следующей отправке. Здесь шлём
+        ACK-only пакет только когда данных нет.
+
+        Примечание: piggyback в writer/_retransmit_loop уже забирает
+        ACK через _drain_pending_acks(). Этот loop — страховка для
+        случая когда исходящих данных долго нет.
+        """
+        try:
+            while not self._stop_event.is_set():
+                # Ждём либо таймера, либо сигнала о новых ACK
+                try:
+                    await asyncio.wait_for(
+                        self._has_pending_acks.wait(),
+                        timeout=self._ack_flush_interval,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                if self._pending_acks.empty():
+                    self._has_pending_acks.clear()
+                    continue
+
+                # Проверяем: если writer вот-вот отправит данные и сделает
+                # piggyback — ждать не нужно, но мы не знаем наверняка.
+                # Поэтому просто шлём ACK-only пакет. Дублирующий ACK
+                # на другой стороне просто проигнорируется (уже удалён из in_flight).
+                ack_seqs = self._drain_pending_acks()
+                if not ack_seqs:
+                    self._has_pending_acks.clear()
+                    continue
+
+                packet = _build_packet(seq=0, ack_seqs=ack_seqs, payload=b"")
+                self._logger.debug(f"Sending ACK-only packet: acks={ack_seqs}")
+
+                try:
+                    await self._send_physical_packet(packet)
+                except Exception:
+                    self._logger.exception("Failed to send ACK-only packet")
+                    # Возвращаем ACK обратно чтобы не потерять
+                    for s in ack_seqs:
+                        self._pending_acks.put_nowait(s)
+                    self._has_pending_acks.set()
+
+                self._has_pending_acks.clear()
+
+        except asyncio.CancelledError:
+            self._logger.debug("ack sender loop cancelled")
+            raise
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _drain_pending_acks(self) -> list[int]:
+        """
+        Забирает до ack_batch_size ACK из очереди не блокируясь.
+        """
+        acks: list[int] = []
+        while len(acks) < self._ack_batch_size:
+            try:
+                acks.append(self._pending_acks.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return acks
 
     async def _send_physical_packet(self, packet: bytes) -> None:
         """
-        Отправляет ОДИН physical packet в transport, строго соблюдая min_send_interval.
-
-        Args:
-            packet: Уже полностью подготовленный transport packet.
+        Отправляет ОДИН physical packet строго соблюдая min_send_interval.
         """
         now = time.monotonic()
         wait_more = self._min_send_interval - (now - self._last_send_ts)
-
         if wait_more > 0:
-            self._logger.debug("Waiting {:.3f}s before next physical send", wait_more)
+            self._logger.debug(f"Waiting {wait_more:.3f}s before next physical send")
             await asyncio.sleep(wait_more)
 
         await asyncio.to_thread(self._transport.send, packet)
         self._last_send_ts = time.monotonic()
 
-    def _encode_transport_packets(self, logical_payload: bytes) -> list[bytes]:
-        """
-        Преобразует один logical payload в один или несколько transport packet.
+    # ------------------------------------------------------------------
+    # Legacy encoding / decoding (режим NONE)
+    # ------------------------------------------------------------------
 
-        Args:
-            logical_payload: Результат _encode_batch(...)
-
-        Returns:
-            Список physical transport packet.
-        """
-        if self._transport_limit is None:
-            return [logical_payload]
-
+    def _encode_legacy_transport_packets(self, logical_payload: bytes) -> list[bytes]:
         if len(logical_payload) <= self._single_packet_payload_limit:
             return [self.SINGLE_MAGIC + logical_payload]
 
-        chunk_payload_limit = self._chunk_packet_payload_limit
-        assert chunk_payload_limit is not None
-
         msg_id = uuid.uuid4().bytes
+        chunk_payload_limit = self._chunk_packet_payload_limit
         total_parts = math.ceil(len(logical_payload) / chunk_payload_limit)
 
         if total_parts > 0xFFFF:
             raise ValueError("logical payload too large: too many chunks")
 
         packets: list[bytes] = []
-
         for part_index in range(total_parts):
             start = part_index * chunk_payload_limit
-            end = start + chunk_payload_limit
-            chunk_data = logical_payload[start:end]
-
+            chunk_data = logical_payload[start : start + chunk_payload_limit]
             packet = (
                 self.CHUNK_MAGIC
                 + self._CHUNK_META_STRUCT.pack(msg_id, part_index, total_parts)
@@ -549,20 +855,7 @@ class AggregatingLink:
 
         return packets
 
-    def _decode_transport_packet(self, raw_packet: bytes) -> list[bytes]:
-        """
-        Декодирует один physical transport packet.
-
-        Returns:
-            Список готовых logical payload.
-            Обычно это либо:
-            - [payload] для SINGLE
-            - [] для промежуточного CHUNK
-            - [payload] при завершении сборки CHUNK
-        """
-        if self._transport_limit is None:
-            return [raw_packet]
-
+    def _decode_legacy_transport_packet(self, raw_packet: bytes) -> list[bytes]:
         if raw_packet.startswith(self.SINGLE_MAGIC):
             return [raw_packet[len(self.SINGLE_MAGIC) :]]
 
@@ -586,37 +879,16 @@ class AggregatingLink:
                     created_at=time.monotonic(),
                 )
                 self._chunk_assemblies[msg_id] = assembly
-                self._logger.debug(
-                    "Created chunk assembly: msg_id={}, total_parts={}",
-                    msg_id.hex(),
-                    total_parts,
-                )
-            else:
-                if assembly.total_parts != total_parts:
-                    raise ValueError("chunk total_parts mismatch")
+            elif assembly.total_parts != total_parts:
+                raise ValueError("chunk total_parts mismatch")
 
             assembly.parts[part_index] = chunk_data
-
-            self._logger.debug(
-                "Received chunk: msg_id={}, part={}/{}, chunk_size={}, received_parts={}",
-                msg_id.hex(),
-                part_index + 1,
-                total_parts,
-                len(chunk_data),
-                len(assembly.parts),
-            )
 
             if len(assembly.parts) == assembly.total_parts:
                 payload = b"".join(
                     assembly.parts[i] for i in range(assembly.total_parts)
                 )
                 del self._chunk_assemblies[msg_id]
-
-                self._logger.debug(
-                    "Chunk assembly complete: msg_id={}, payload_size={}",
-                    msg_id.hex(),
-                    len(payload),
-                )
                 return [payload]
 
             return []
@@ -624,45 +896,30 @@ class AggregatingLink:
         raise ValueError("unknown transport packet magic")
 
     def _cleanup_stale_chunk_assemblies(self) -> None:
-        """
-        Удаляет старые незавершенные chunk assemblies.
-        """
         if not self._chunk_assemblies:
             return
-
         now = time.monotonic()
         stale_ids = [
             msg_id
             for msg_id, assembly in self._chunk_assemblies.items()
             if now - assembly.created_at > self._chunk_assembly_ttl
         ]
-
         for msg_id in stale_ids:
             self._logger.warning(
-                "Dropping stale chunk assembly: msg_id={}", msg_id.hex()
+                f"Dropping stale chunk assembly: msg_id={msg_id.hex()}"
             )
             del self._chunk_assemblies[msg_id]
 
+    # ------------------------------------------------------------------
+    # Batch encoding / decoding (без изменений)
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _estimate_frame_size(frame: Frame) -> int:
-        """
-        Грубая оценка размера logical frame.
-
-        Нужна только для batching decision, а не для точного wire-size.
-        """
         return 64 + len(frame.stream_id) + len(frame.frame_type) + len(frame.payload)
 
     @staticmethod
     def _encode_batch(frames: list[Frame]) -> bytes:
-        """
-        Кодирует список logical frame в один logical payload.
-
-        Args:
-            frames: Список frame.
-
-        Returns:
-            Msgpack bytes.
-        """
         data: list[dict[str, Any]] = [
             {
                 "s": frame.stream_id,
@@ -676,25 +933,12 @@ class AggregatingLink:
 
     @staticmethod
     def _decode_batch(raw: bytes) -> list[Frame]:
-        """
-        Декодирует logical payload обратно в список Frame.
-
-        Args:
-            raw: Msgpack payload.
-
-        Returns:
-            Список Frame.
-
-        Raises:
-            ValueError: Если формат payload некорректен.
-        """
         items = msgpack.unpackb(raw, raw=False)
 
         if not isinstance(items, list):
             raise ValueError("batch must be a list")
 
         frames: list[Frame] = []
-
         for item in items:
             if not isinstance(item, dict):
                 raise ValueError("frame must be dict")
@@ -706,10 +950,8 @@ class AggregatingLink:
 
             if not isinstance(stream_id, str):
                 raise ValueError("stream_id must be str")
-
             if not isinstance(frame_type, str):
                 raise ValueError("frame_type must be str")
-
             if not isinstance(payload, (bytes, bytearray)):
                 raise ValueError("payload must be bytes")
 
@@ -723,6 +965,10 @@ class AggregatingLink:
             )
 
         return frames
+
+    # ------------------------------------------------------------------
+    # Shutdown watcher
+    # ------------------------------------------------------------------
 
     async def _shutdown_watcher(self):
         try:
