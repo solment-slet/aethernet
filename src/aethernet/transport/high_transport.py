@@ -96,7 +96,7 @@ class _InFlightPacket:
 
 _PACKET_MAGIC = b"AGP1"
 _PACKET_HEADER_STRUCT = struct.Struct(">IB")  # seq: uint32, ack_count: uint8
-_ACK_SEQ_STRUCT = struct.Struct(">I")         # один ack_seq: uint32
+_ACK_SEQ_STRUCT = struct.Struct(">I")  # один ack_seq: uint32
 
 # Заголовок без ACK и без payload
 _MIN_PACKET_HEADER_SIZE = len(_PACKET_MAGIC) + _PACKET_HEADER_STRUCT.size
@@ -263,18 +263,26 @@ class AggregatingLink:
 
         self._transport_limit: int = self._transport.max_payload_bytes
 
-        self._single_packet_payload_limit = self._transport_limit - len(self.SINGLE_MAGIC)
+        self._single_packet_payload_limit = self._transport_limit - len(
+            self.SINGLE_MAGIC
+        )
         self._chunk_packet_payload_limit = (
             self._transport_limit - len(self.CHUNK_MAGIC) - self._CHUNK_META_STRUCT.size
         )
         self._agp1_payload_limit = self._transport_limit - _MIN_PACKET_HEADER_SIZE
 
         if self._single_packet_payload_limit <= 0:
-            raise ValueError("transport.max_payload_bytes too small for SINGLE packet framing")
+            raise ValueError(
+                "transport.max_payload_bytes too small for SINGLE packet framing"
+            )
         if self._chunk_packet_payload_limit <= 0:
-            raise ValueError("transport.max_payload_bytes too small for CHUNK packet framing")
+            raise ValueError(
+                "transport.max_payload_bytes too small for CHUNK packet framing"
+            )
         if self._agp1_payload_limit <= 0:
-            raise ValueError("transport.max_payload_bytes too small for AGP1 packet framing")
+            raise ValueError(
+                "transport.max_payload_bytes too small for AGP1 packet framing"
+            )
 
         self._max_batch_size = min(max_batch_size, self._single_packet_payload_limit)
 
@@ -380,7 +388,8 @@ class AggregatingLink:
             await asyncio.to_thread(self._transport.low_transport.close)
 
             tasks = [
-                t for t in (
+                t
+                for t in (
                     self._reader_task,
                     self._writer_task,
                     self._retransmit_task,
@@ -476,10 +485,14 @@ class AggregatingLink:
 
                 try:
                     if self._reliability_mode == ReliabilityMode.NONE:
-                        logical_payloads = self._decode_legacy_transport_packet(raw_packet)
+                        logical_payloads = self._decode_legacy_transport_packet(
+                            raw_packet
+                        )
                         ack_seqs_received: list[int] = []
                     else:
-                        logical_payloads, ack_seqs_received = self._decode_agp1_packet(raw_packet)
+                        logical_payloads, ack_seqs_received = self._decode_agp1_packet(
+                            raw_packet
+                        )
                 except Exception as e:
                     self._logger.error(f"Получен битый transport packet: {e}")
                     continue
@@ -603,7 +616,8 @@ class AggregatingLink:
 
         now = time.monotonic()
         stale = [
-            seq for seq, (_, arrival) in self._reorder_buffer.items()
+            seq
+            for seq, (_, arrival) in self._reorder_buffer.items()
             if now - arrival > self._reorder_buffer_ttl
         ]
         for seq in stale:
@@ -761,7 +775,8 @@ class AggregatingLink:
 
                 now = time.monotonic()
                 to_retransmit = [
-                    pkt for pkt in self._in_flight.values()
+                    pkt
+                    for pkt in self._in_flight.values()
                     if now - pkt.last_send_time >= self._delay_before_resending
                 ]
 
@@ -882,7 +897,7 @@ class AggregatingLink:
         packets: list[bytes] = []
         for part_index in range(total_parts):
             start = part_index * chunk_payload_limit
-            chunk_data = logical_payload[start: start + chunk_payload_limit]
+            chunk_data = logical_payload[start : start + chunk_payload_limit]
             packet = (
                 self.CHUNK_MAGIC
                 + self._CHUNK_META_STRUCT.pack(msg_id, part_index, total_parts)
@@ -894,7 +909,7 @@ class AggregatingLink:
 
     def _decode_legacy_transport_packet(self, raw_packet: bytes) -> list[bytes]:
         if raw_packet.startswith(self.SINGLE_MAGIC):
-            return [raw_packet[len(self.SINGLE_MAGIC):]]
+            return [raw_packet[len(self.SINGLE_MAGIC) :]]
 
         if raw_packet.startswith(self.CHUNK_MAGIC):
             header_start = len(self.CHUNK_MAGIC)
@@ -937,11 +952,14 @@ class AggregatingLink:
             return
         now = time.monotonic()
         stale_ids = [
-            msg_id for msg_id, assembly in self._chunk_assemblies.items()
+            msg_id
+            for msg_id, assembly in self._chunk_assemblies.items()
             if now - assembly.created_at > self._chunk_assembly_ttl
         ]
         for msg_id in stale_ids:
-            self._logger.warning(f"Dropping stale chunk assembly: msg_id={msg_id.hex()}")
+            self._logger.warning(
+                f"Dropping stale chunk assembly: msg_id={msg_id.hex()}"
+            )
             del self._chunk_assemblies[msg_id]
 
     # ------------------------------------------------------------------
@@ -989,12 +1007,14 @@ class AggregatingLink:
             if not isinstance(payload, (bytes, bytearray)):
                 raise ValueError("payload must be bytes")
 
-            frames.append(Frame(
-                stream_id=stream_id,
-                frame_type=frame_type,
-                payload=bytes(payload),
-                end=end,
-            ))
+            frames.append(
+                Frame(
+                    stream_id=stream_id,
+                    frame_type=frame_type,
+                    payload=bytes(payload),
+                    end=end,
+                )
+            )
 
         return frames
 

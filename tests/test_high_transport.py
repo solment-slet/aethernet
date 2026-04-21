@@ -24,6 +24,7 @@
     Никаких sys.modules подмен нет.
     Убедитесь что пакет aethernet доступен в PYTHONPATH.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -41,10 +42,10 @@ from aethernet.transport.high_transport import (
     _parse_packet,
 )
 
-
 # ---------------------------------------------------------------------------
 # FakeLowTransport
 # ---------------------------------------------------------------------------
+
 
 class FakeLowTransport:
     """
@@ -109,13 +110,15 @@ class FakeLowTransport:
     ) -> tuple[FakeLowTransport, FakeLowTransport]:
         """Создаёт пару связанных транспортов: a.send() → b.recv() и наоборот."""
         a = FakeLowTransport(
-            drop_rate=drop_rate, delay=delay,
+            drop_rate=drop_rate,
+            delay=delay,
             min_send_interval=min_send_interval,
             min_recv_interval=min_recv_interval,
             delay_before_resending=delay_before_resending,
         )
         b = FakeLowTransport(
-            drop_rate=drop_rate, delay=delay,
+            drop_rate=drop_rate,
+            delay=delay,
             min_send_interval=min_send_interval,
             min_recv_interval=min_recv_interval,
             delay_before_resending=delay_before_resending,
@@ -128,6 +131,7 @@ class FakeLowTransport:
 # ---------------------------------------------------------------------------
 # FakeMediumTransport — обёртка которую видит AggregatingLink
 # ---------------------------------------------------------------------------
+
 
 class _FakeConfig:
     def __init__(self, low: FakeLowTransport):
@@ -166,27 +170,35 @@ class FakeMediumTransport:
 # Профили транспортов
 # ---------------------------------------------------------------------------
 
+
 def reliable_fast() -> tuple[FakeLowTransport, FakeLowTransport]:
-    return FakeLowTransport.linked_pair(drop_rate=0.0, delay=0.0,
-                                        delay_before_resending=0.3)
+    return FakeLowTransport.linked_pair(
+        drop_rate=0.0, delay=0.0, delay_before_resending=0.3
+    )
+
 
 def reliable_slow() -> tuple[FakeLowTransport, FakeLowTransport]:
-    return FakeLowTransport.linked_pair(drop_rate=0.0, delay=0.05,
-                                        min_send_interval=0.05,
-                                        delay_before_resending=0.5)
+    return FakeLowTransport.linked_pair(
+        drop_rate=0.0, delay=0.05, min_send_interval=0.05, delay_before_resending=0.5
+    )
+
 
 def unreliable_30() -> tuple[FakeLowTransport, FakeLowTransport]:
-    return FakeLowTransport.linked_pair(drop_rate=0.30, delay=0.0,
-                                        delay_before_resending=0.15)
+    return FakeLowTransport.linked_pair(
+        drop_rate=0.30, delay=0.0, delay_before_resending=0.15
+    )
+
 
 def unreliable_60() -> tuple[FakeLowTransport, FakeLowTransport]:
-    return FakeLowTransport.linked_pair(drop_rate=0.60, delay=0.0,
-                                        delay_before_resending=0.1)
+    return FakeLowTransport.linked_pair(
+        drop_rate=0.60, delay=0.0, delay_before_resending=0.1
+    )
 
 
 # ---------------------------------------------------------------------------
 # Вспомогательные фабрики
 # ---------------------------------------------------------------------------
+
 
 def make_pair(
     low_a: FakeLowTransport,
@@ -232,7 +244,11 @@ async def start_and_close(link_a, link_b, coro):
 # Параметризация
 # ---------------------------------------------------------------------------
 
-ALL_MODES = [ReliabilityMode.NONE, ReliabilityMode.STOP_AND_WAIT, ReliabilityMode.PARALLEL]
+ALL_MODES = [
+    ReliabilityMode.NONE,
+    ReliabilityMode.STOP_AND_WAIT,
+    ReliabilityMode.PARALLEL,
+]
 ARQ_MODES = [ReliabilityMode.STOP_AND_WAIT, ReliabilityMode.PARALLEL]
 MODE_IDS = {
     ReliabilityMode.NONE: "none",
@@ -245,12 +261,14 @@ MODE_IDS = {
 # 1. Базовая доставка
 # ===========================================================================
 
+
 class TestBasicDelivery:
 
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_single_frame(self, mode):
         async def body():
             la, lb = make_pair(*reliable_fast(), mode=mode)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 await la.send_frame(sid, "data", b"hello", end=True)
@@ -258,26 +276,32 @@ class TestBasicDelivery:
                 assert frame.payload == b"hello"
                 assert frame.frame_type == "data"
                 assert frame.end is True
+
             await start_and_close(la, lb, work())
+
         run(body())
 
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_empty_payload(self, mode):
         async def body():
             la, lb = make_pair(*reliable_fast(), mode=mode)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 await la.send_frame(sid, "ping", b"")
                 frame = await asyncio.wait_for(lb.recv_frame(sid), timeout=3.0)
                 assert frame.payload == b""
                 assert frame.frame_type == "ping"
+
             await start_and_close(la, lb, work())
+
         run(body())
 
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_multiple_frames_ordered(self, mode):
         async def body():
             la, lb = make_pair(*reliable_fast(), mode=mode)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 n = 10
@@ -287,13 +311,16 @@ class TestBasicDelivery:
                 async for f in lb.iter_stream(sid):
                     received.append(f.payload)
                 assert received == [str(i).encode() for i in range(n)]
+
             await start_and_close(la, lb, work())
+
         run(body())
 
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_bidirectional(self, mode):
         async def body():
             la, lb = make_pair(*reliable_fast(), mode=mode)
+
             async def work():
                 sid_ab = AggregatingLink.new_stream_id()
                 sid_ba = AggregatingLink.new_stream_id()
@@ -303,13 +330,16 @@ class TestBasicDelivery:
                 f_at_a = await asyncio.wait_for(la.recv_frame(sid_ba), timeout=3.0)
                 assert f_at_b.payload == b"from-a"
                 assert f_at_a.payload == b"from-b"
+
             await start_and_close(la, lb, work())
+
         run(body())
 
 
 # ===========================================================================
 # 2. Порядок между батчами (reorder buffer) — ключевой тест
 # ===========================================================================
+
 
 class TestReorderBuffer:
     """
@@ -324,13 +354,15 @@ class TestReorderBuffer:
         Вручную кладём пакеты в inbox получателя в обратном порядке.
         Reorder buffer должен выдать frame в исходном порядке.
         """
+
         async def body():
             low_a, low_b = reliable_fast()
-            la, lb = make_pair(low_a, low_b, mode=ReliabilityMode.PARALLEL, window_size=8)
+            la, lb = make_pair(
+                low_a, low_b, mode=ReliabilityMode.PARALLEL, window_size=8
+            )
 
             # Перехватываем send чтобы собрать пакеты не отправляя их
             captured: list[bytes] = []
-            original_send = low_a.send
 
             def capturing_send(data: bytes):
                 captured.append(data)
@@ -360,9 +392,7 @@ class TestReorderBuffer:
                     frame = await asyncio.wait_for(lb.recv_frame(sid), timeout=5.0)
                     received.append(frame.payload)
 
-                assert received == [b"0", b"1", b"2"], (
-                    f"Order broken: {received}"
-                )
+                assert received == [b"0", b"1", b"2"], f"Order broken: {received}"
             finally:
                 await la.close()
                 await lb.close()
@@ -371,8 +401,10 @@ class TestReorderBuffer:
 
     def test_parallel_ordered_on_reliable(self):
         """PARALLEL на надёжном транспорте — порядок строгий."""
+
         async def body():
             la, lb = make_pair(*reliable_fast(), mode=ReliabilityMode.PARALLEL)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 n = 20
@@ -382,13 +414,19 @@ class TestReorderBuffer:
                 async for f in lb.iter_stream(sid):
                     received.append(int(f.payload.decode()))
                 assert received == list(range(n)), f"Order broken: {received}"
+
             await start_and_close(la, lb, work())
+
         run(body())
 
     def test_parallel_ordered_on_unreliable(self):
         """PARALLEL на ненадёжном транспорте — порядок строгий несмотря на ретрансмиты."""
+
         async def body():
-            la, lb = make_pair(*unreliable_30(), mode=ReliabilityMode.PARALLEL, window_size=4)
+            la, lb = make_pair(
+                *unreliable_30(), mode=ReliabilityMode.PARALLEL, window_size=4
+            )
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 n = 8
@@ -398,16 +436,20 @@ class TestReorderBuffer:
                 async for f in lb.iter_stream(sid):
                     received.append(int(f.payload.decode()))
                 assert received == list(range(n)), f"Order broken: {received}"
+
             await start_and_close(la, lb, work())
+
         run(body())
 
     def test_reorder_buffer_empty_after_delivery(self):
         """После доставки всех фреймов reorder buffer пуст и next_expected_seq > 1."""
+
         async def body():
             low_a, low_b = reliable_fast()
             # flush_interval=0 чтобы каждый фрейм шёл отдельным физическим пакетом
-            la, lb = make_pair(low_a, low_b, mode=ReliabilityMode.PARALLEL,
-                               flush_interval=0.0)
+            la, lb = make_pair(
+                low_a, low_b, mode=ReliabilityMode.PARALLEL, flush_interval=0.0
+            )
             await la.start()
             await lb.start()
             try:
@@ -427,6 +469,7 @@ class TestReorderBuffer:
             finally:
                 await la.close()
                 await lb.close()
+
         run(body())
 
 
@@ -434,12 +477,14 @@ class TestReorderBuffer:
 # 3. Батчинг
 # ===========================================================================
 
+
 class TestBatching:
 
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_all_frames_delivered(self, mode):
         async def body():
             la, lb = make_pair(*reliable_fast(), mode=mode, flush_interval=0.2)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 n = 20
@@ -450,7 +495,9 @@ class TestBatching:
                     received.append(f.payload)
                 assert len(received) == n
                 assert received == [f"x{i}".encode() for i in range(n)]
+
             await start_and_close(la, lb, work())
+
         run(body())
 
 
@@ -458,12 +505,14 @@ class TestBatching:
 # 4. Множественные стримы
 # ===========================================================================
 
+
 class TestMultipleStreams:
 
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_independent_streams(self, mode):
         async def body():
             la, lb = make_pair(*reliable_fast(), mode=mode)
+
             async def work():
                 streams = [AggregatingLink.new_stream_id() for _ in range(5)]
                 for sid in streams:
@@ -471,19 +520,24 @@ class TestMultipleStreams:
                 for sid in streams:
                     frame = await asyncio.wait_for(lb.recv_frame(sid), timeout=3.0)
                     assert frame.payload == sid.encode()
+
             await start_and_close(la, lb, work())
+
         run(body())
 
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_accept_stream(self, mode):
         async def body():
             la, lb = make_pair(*reliable_fast(), mode=mode)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 await la.send_frame(sid, "hello", b"world")
                 discovered = await asyncio.wait_for(lb.accept_stream(), timeout=3.0)
                 assert discovered == sid
+
             await start_and_close(la, lb, work())
+
         run(body())
 
 
@@ -491,36 +545,44 @@ class TestMultipleStreams:
 # 5. Ретрансмиссия на ненадёжном транспорте (ARQ режимы)
 # ===========================================================================
 
+
 class TestRetransmission:
 
     @pytest.mark.parametrize("mode", ARQ_MODES, ids=[MODE_IDS[m] for m in ARQ_MODES])
     def test_delivery_30pct_loss(self, mode):
         async def body():
             la, lb = make_pair(*unreliable_30(), mode=mode)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 await la.send_frame(sid, "data", b"must arrive", end=True)
                 frame = await asyncio.wait_for(lb.recv_frame(sid), timeout=10.0)
                 assert frame.payload == b"must arrive"
+
             await start_and_close(la, lb, work())
+
         run(body())
 
     @pytest.mark.parametrize("mode", ARQ_MODES, ids=[MODE_IDS[m] for m in ARQ_MODES])
     def test_delivery_60pct_loss(self, mode):
         async def body():
             la, lb = make_pair(*unreliable_60(), mode=mode)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 await la.send_frame(sid, "data", b"still arrives", end=True)
                 frame = await asyncio.wait_for(lb.recv_frame(sid), timeout=15.0)
                 assert frame.payload == b"still arrives"
+
             await start_and_close(la, lb, work())
+
         run(body())
 
     @pytest.mark.parametrize("mode", ARQ_MODES, ids=[MODE_IDS[m] for m in ARQ_MODES])
     def test_multiple_frames_unreliable(self, mode):
         async def body():
             la, lb = make_pair(*unreliable_30(), mode=mode, window_size=4)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 n = 6
@@ -531,7 +593,9 @@ class TestRetransmission:
                     received.append(f.payload)
                 assert len(received) == n
                 assert received == [str(i).encode() for i in range(n)]
+
             await start_and_close(la, lb, work())
+
         run(body())
 
 
@@ -539,19 +603,23 @@ class TestRetransmission:
 # 6. Дедупликация и bounded received_seqs
 # ===========================================================================
 
+
 class TestDeduplication:
 
     def test_duplicate_not_delivered_twice(self):
         """Дубликат физического пакета не порождает дубликат frame."""
+
         async def body():
             low_a, low_b = reliable_fast()
             la, lb = make_pair(low_a, low_b, mode=ReliabilityMode.PARALLEL)
 
             sent: list[bytes] = []
             orig = low_a.send
+
             def capture(data):
                 sent.append(data)
                 orig(data)
+
             low_a.send = capture
 
             await la.start()
@@ -574,15 +642,20 @@ class TestDeduplication:
             finally:
                 await la.close()
                 await lb.close()
+
         run(body())
 
     def test_received_seqs_bounded(self):
         """_received_seqs никогда не превышает maxlen."""
+
         async def body():
             low_a, low_b = reliable_fast()
-            la, lb = make_pair(low_a, low_b, mode=ReliabilityMode.PARALLEL, window_size=4)
+            la, lb = make_pair(
+                low_a, low_b, mode=ReliabilityMode.PARALLEL, window_size=4
+            )
 
             import collections
+
             lb._received_seqs = collections.deque(maxlen=16)
             lb._received_seqs_set = set()
 
@@ -602,6 +675,7 @@ class TestDeduplication:
             finally:
                 await la.close()
                 await lb.close()
+
         run(body())
 
 
@@ -609,10 +683,12 @@ class TestDeduplication:
 # 7. Piggyback ACK
 # ===========================================================================
 
+
 class TestAckPiggyback:
 
     def test_packet_count_reasonable_bidirectional(self):
         """При двунаправленной передаче общее число физических пакетов разумно."""
+
         async def body():
             low_a, low_b = reliable_fast()
             la, lb = make_pair(low_a, low_b, mode=ReliabilityMode.PARALLEL)
@@ -620,10 +696,12 @@ class TestAckPiggyback:
             total = 0
             for low in (low_a, low_b):
                 orig = low.send
+
                 def counting(data, _orig=orig):
                     nonlocal total
                     total += 1
                     _orig(data)
+
                 low.send = counting
 
             await la.start()
@@ -643,12 +721,14 @@ class TestAckPiggyback:
             finally:
                 await la.close()
                 await lb.close()
+
         run(body())
 
 
 # ===========================================================================
 # 8. Режим NONE — формат пакетов
 # ===========================================================================
+
 
 class TestModeNone:
 
@@ -659,7 +739,11 @@ class TestModeNone:
 
             sent: list[bytes] = []
             orig = low_a.send
-            def capture(d): sent.append(d); orig(d)
+
+            def capture(d):
+                sent.append(d)
+                orig(d)
+
             low_a.send = capture
 
             await la.start()
@@ -672,6 +756,7 @@ class TestModeNone:
             finally:
                 await la.close()
                 await lb.close()
+
         run(body())
 
     def test_arq_uses_agp1_format(self):
@@ -681,7 +766,11 @@ class TestModeNone:
 
             sent: list[bytes] = []
             orig = low_a.send
-            def capture(d): sent.append(d); orig(d)
+
+            def capture(d):
+                sent.append(d)
+                orig(d)
+
             low_a.send = capture
 
             await la.start()
@@ -694,6 +783,7 @@ class TestModeNone:
             finally:
                 await la.close()
                 await lb.close()
+
         run(body())
 
 
@@ -701,26 +791,32 @@ class TestModeNone:
 # 9. Большие payload — chunking (режим NONE)
 # ===========================================================================
 
+
 class TestChunking:
 
     def test_large_payload_delivered(self):
         async def body():
             low_a, low_b = reliable_fast()
-            la, lb = make_pair(low_a, low_b, mode=ReliabilityMode.NONE,
-                               max_payload_bytes=512)
+            la, lb = make_pair(
+                low_a, low_b, mode=ReliabilityMode.NONE, max_payload_bytes=512
+            )
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 big = b"X" * 2000
                 await la.send_frame(sid, "data", big, end=True)
                 frame = await asyncio.wait_for(lb.recv_frame(sid), timeout=5.0)
                 assert frame.payload == big
+
             await start_and_close(la, lb, work())
+
         run(body())
 
 
 # ===========================================================================
 # 10. Lifecycle
 # ===========================================================================
+
 
 class TestLifecycle:
 
@@ -731,6 +827,7 @@ class TestLifecycle:
             await la.start()  # второй вызов безопасен
             await la.close()
             await lb.close()
+
         run(body())
 
     def test_close_idempotent(self):
@@ -741,6 +838,7 @@ class TestLifecycle:
             await la.close()
             await la.close()  # второй вызов безопасен
             await lb.close()
+
         run(body())
 
     def test_send_after_close_raises(self):
@@ -752,6 +850,7 @@ class TestLifecycle:
             await lb.close()
             with pytest.raises(RuntimeError, match="closed"):
                 await la.send_frame("sid", "t", b"x")
+
         run(body())
 
     def test_send_before_start_raises(self):
@@ -762,6 +861,7 @@ class TestLifecycle:
             with pytest.raises(RuntimeError, match="start"):
                 await link.send_frame("sid", "t", b"x")
             await link.close()
+
         run(body())
 
     def test_invalid_payload_type_raises(self):
@@ -775,6 +875,7 @@ class TestLifecycle:
             finally:
                 await la.close()
                 await lb.close()
+
         run(body())
 
     def test_start_after_close_raises(self):
@@ -786,6 +887,7 @@ class TestLifecycle:
             await lb.close()
             with pytest.raises(RuntimeError, match="closed"):
                 await la.start()
+
         run(body())
 
 
@@ -793,18 +895,22 @@ class TestLifecycle:
 # 11. Медленный транспорт
 # ===========================================================================
 
+
 class TestSlowTransport:
 
     @pytest.mark.parametrize("mode", ARQ_MODES, ids=[MODE_IDS[m] for m in ARQ_MODES])
     def test_delivery_slow_reliable(self, mode):
         async def body():
             la, lb = make_pair(*reliable_slow(), mode=mode)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 await la.send_frame(sid, "data", b"slow but sure", end=True)
                 frame = await asyncio.wait_for(lb.recv_frame(sid), timeout=10.0)
                 assert frame.payload == b"slow but sure"
+
             await start_and_close(la, lb, work())
+
         run(body())
 
 
@@ -812,21 +918,25 @@ class TestSlowTransport:
 # 12. STOP_AND_WAIT специфика
 # ===========================================================================
 
+
 class TestStopAndWait:
 
     def test_window_size_forced_to_one(self):
         async def body():
             low_a, low_b = reliable_fast()
-            la, lb = make_pair(low_a, low_b,
-                               mode=ReliabilityMode.STOP_AND_WAIT, window_size=8)
+            la, lb = make_pair(
+                low_a, low_b, mode=ReliabilityMode.STOP_AND_WAIT, window_size=8
+            )
             assert la._window_size == 1
             await la.close()
             await lb.close()
+
         run(body())
 
     def test_ordered_delivery(self):
         async def body():
             la, lb = make_pair(*reliable_fast(), mode=ReliabilityMode.STOP_AND_WAIT)
+
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 n = 10
@@ -836,7 +946,9 @@ class TestStopAndWait:
                 async for f in lb.iter_stream(sid):
                     received.append(int(f.payload.decode()))
                 assert received == list(range(n))
+
             await start_and_close(la, lb, work())
+
         run(body())
 
 
@@ -844,31 +956,37 @@ class TestStopAndWait:
 # 13. PARALLEL специфика
 # ===========================================================================
 
+
 class TestParallel:
 
     def test_window_semaphore_initial_value(self):
         async def body():
             low_a, low_b = reliable_fast()
-            la, lb = make_pair(low_a, low_b,
-                               mode=ReliabilityMode.PARALLEL, window_size=4)
+            la, lb = make_pair(
+                low_a, low_b, mode=ReliabilityMode.PARALLEL, window_size=4
+            )
             assert la._window_size == 4
             assert la._window_semaphore._value == 4
             await la.close()
             await lb.close()
+
         run(body())
 
     def test_many_concurrent_streams(self):
         async def body():
-            la, lb = make_pair(*reliable_fast(),
-                               mode=ReliabilityMode.PARALLEL, window_size=8)
+            la, lb = make_pair(
+                *reliable_fast(), mode=ReliabilityMode.PARALLEL, window_size=8
+            )
+
             async def work():
                 streams = [AggregatingLink.new_stream_id() for _ in range(6)]
                 n = 4
 
                 async def send_stream(sid):
                     for i in range(n):
-                        await la.send_frame(sid, "d", f"{sid}:{i}".encode(),
-                                            end=(i == n - 1))
+                        await la.send_frame(
+                            sid, "d", f"{sid}:{i}".encode(), end=(i == n - 1)
+                        )
 
                 async def recv_stream(sid) -> list[bytes]:
                     result = []
@@ -883,16 +1001,19 @@ class TestParallel:
                     ),
                     timeout=15.0,
                 )
-                for i, received in enumerate(results[len(streams):]):
+                for i, received in enumerate(results[len(streams) :]):
                     sid = streams[i]
                     assert received == [f"{sid}:{j}".encode() for j in range(n)]
+
             await start_and_close(la, lb, work())
+
         run(body())
 
 
 # ===========================================================================
 # 14. new_stream_id
 # ===========================================================================
+
 
 class TestStreamId:
 
@@ -909,6 +1030,7 @@ class TestStreamId:
 # ===========================================================================
 # 15. Packet codec — unit tests
 # ===========================================================================
+
 
 class TestPacketCodec:
 
@@ -962,31 +1084,37 @@ class TestPacketCodec:
 try:
     from hypothesis import given, settings, HealthCheck
     from hypothesis import strategies as st
+
     _HYPOTHESIS = True
 except ImportError:
     _HYPOTHESIS = False
 
 if _HYPOTHESIS:
+
     class TestHypothesis:
 
         @given(
             payload=st.binary(min_size=0, max_size=4096),
             frame_type=st.text(
                 alphabet=st.characters(whitelist_categories=("Lu", "Ll", "Nd")),
-                min_size=1, max_size=20,
+                min_size=1,
+                max_size=20,
             ),
         )
         @settings(max_examples=40, suppress_health_check=[HealthCheck.too_slow])
         def test_arbitrary_payload_none(self, payload, frame_type):
             async def body():
                 la, lb = make_pair(*reliable_fast(), mode=ReliabilityMode.NONE)
+
                 async def work():
                     sid = AggregatingLink.new_stream_id()
                     await la.send_frame(sid, frame_type, payload, end=True)
                     frame = await asyncio.wait_for(lb.recv_frame(sid), timeout=3.0)
                     assert frame.payload == payload
                     assert frame.frame_type == frame_type
+
                 await start_and_close(la, lb, work())
+
             run(body())
 
         @given(payload=st.binary(min_size=0, max_size=1024))
@@ -994,12 +1122,15 @@ if _HYPOTHESIS:
         def test_arbitrary_payload_parallel(self, payload):
             async def body():
                 la, lb = make_pair(*reliable_fast(), mode=ReliabilityMode.PARALLEL)
+
                 async def work():
                     sid = AggregatingLink.new_stream_id()
                     await la.send_frame(sid, "data", payload, end=True)
                     frame = await asyncio.wait_for(lb.recv_frame(sid), timeout=5.0)
                     assert frame.payload == payload
+
                 await start_and_close(la, lb, work())
+
             run(body())
 
         @given(st.lists(st.integers(min_value=1, max_value=2**32 - 1), max_size=255))
