@@ -1,7 +1,7 @@
 [project]
 name = "aethernet-core"
 version = "2.0.1"
-description = "Full HTTP and WebSocket traffic over any text-based transport — messengers, SMS, or anything else that can carry a string."
+description = "Full HTTP and WebSocket traffic over any message-based transport — strings or bytes."
 authors = [
     { name = "Walter Kerrigan", email = "esolment@gmail.com" },
 ]
