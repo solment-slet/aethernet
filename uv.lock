@@ -4,7 +4,7 @@ requires-python = ">=3.12, <3.14"
 
 [[package]]
 name = "aethernet-core"
-version = "2.0.0rc1"
+version = "2.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "basex-python" },
