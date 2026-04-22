@@ -94,7 +94,9 @@ Aethernet has two sides:
 
 Both sides must use:
 - the same `LowTransport` implementation (or compatible ones)
+- the same `encryption_mode`
 - the same `encryption_key` (if encryption is enabled)
+- the same `reliability_mode`
 
 ### 1) Define your transport (bytes-mode example)
 
@@ -120,11 +122,11 @@ class MyTransport(LowTransport):
         # release resources (optional)
         pass
 
-    def send(self, data: str | bytes) -> None:
+    def send(self, data:  bytes) -> None:
         # deliver `data` through your channel
         raise NotImplementedError
 
-    def recv(self) -> str | bytes:
+    def recv(self) -> bytes:
         # return the next incoming message
         raise NotImplementedError
 ```
@@ -223,12 +225,12 @@ class SmsLikeTransport(LowTransport):
     def __init__(self, *, config: LowTransportConfig | None = None) -> None:
         super().__init__(config)
 
-    def send(self, data: str | bytes) -> None:
+    def send(self, data: str) -> None:
         # In string mode you will typically send `str` messages
         # (the stack will produce appropriate payloads for your mode).
         raise NotImplementedError
 
-    def recv(self) -> str | bytes:
+    def recv(self) -> str:
         raise NotImplementedError
 ```
 
@@ -374,6 +376,7 @@ EncryptionMode.AES_EAX
 
 ```
 aethernet-core/
+├── .github/
 ├── src/
 │   └── aethernet/
 │       ├── transport/
@@ -383,8 +386,11 @@ aethernet-core/
 │       └── typing.py
 ├── tests/
 ├── pyproject.toml
+├── .gitignore
 ├── LICENSE
 ├── NOTICE
+├── uv.lock
+├── README.ru.md
 └── README.md
 ```
 

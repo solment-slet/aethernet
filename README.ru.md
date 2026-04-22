@@ -94,7 +94,9 @@ from aethernet import (
 
 Обе стороны должны использовать:
 - одинаковый `LowTransport` (или совместимые реализации)
+- одинаковый `encryption_mode`
 - одинаковый `encryption_key` (если включено шифрование)
+- одинаковый `reliability_mode`
 
 ### 1) Определите транспорт (пример для bytes-mode)
 
@@ -120,11 +122,11 @@ class MyTransport(LowTransport):
         # освобождение ресурсов (опционально)
         pass
 
-    def send(self, data: str | bytes) -> None:
+    def send(self, data: bytes) -> None:
         # отправьте `data` через ваш канал
         raise NotImplementedError
 
-    def recv(self) -> str | bytes:
+    def recv(self) -> bytes:
         # верните следующее входящее сообщение
         raise NotImplementedError
 ```
@@ -223,12 +225,12 @@ class SmsLikeTransport(LowTransport):
     def __init__(self, *, config: LowTransportConfig | None = None) -> None:
         super().__init__(config)
 
-    def send(self, data: str | bytes) -> None:
+    def send(self, data: str) -> None:
         # В string-mode вы обычно отправляете `str`
         # (стек сам сформирует корректный payload под выбранный режим).
         raise NotImplementedError
 
-    def recv(self) -> str | bytes:
+    def recv(self) -> str:
         raise NotImplementedError
 ```
 
@@ -236,7 +238,7 @@ class SmsLikeTransport(LowTransport):
 
 ## Как пользователю менять лимиты: `dataclasses.replace`
 
-Поскольку конфиг — dataclass, пользователь может переопределить пару полей:
+Поскольку конфиг — dataclass, пользователь может переопределить конфигурацию:
 
 ```python
 from dataclasses import replace
@@ -374,6 +376,7 @@ EncryptionMode.AES_EAX
 
 ```
 aethernet-core/
+├── .github/
 ├── src/
 │   └── aethernet/
 │       ├── transport/
@@ -383,8 +386,11 @@ aethernet-core/
 │       └── typing.py
 ├── tests/
 ├── pyproject.toml
+├── .gitignore
 ├── LICENSE
 ├── NOTICE
+├── uv.lock
+├── README.ru.md
 └── README.md
 ```
 
