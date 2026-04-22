@@ -221,7 +221,7 @@ class AggregatingLink:
         ack_flush_interval: float = 0.1,
         ack_batch_size: int = 8,
         received_seqs_window: int = 256,
-        reorder_buffer_ttl: float = 60.0,
+        reorder_buffer_ttl: float = 500.0,
     ) -> None:
         """
         Args:

@@ -346,6 +346,7 @@ class AethernetServer(ServerRouter):
         ack_flush_interval: float = 0.1,
         ack_batch_size: int = 8,
         received_seqs_window: int = 256,
+        reorder_buffer_ttl: float = 500.0,
         # Server Router
         http_client: httpx.AsyncClient = httpx.AsyncClient(
             timeout=None, trust_env=False
@@ -369,6 +370,7 @@ class AethernetServer(ServerRouter):
             ack_batch_size=ack_batch_size,
             received_seqs_window=received_seqs_window,
             chunk_assembly_ttl=chunk_assembly_ttl,
+            reorder_buffer_ttl=reorder_buffer_ttl,
             logger=logger,
         )
 

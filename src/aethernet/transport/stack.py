@@ -22,6 +22,7 @@ async def get_transport(
     ack_flush_interval: float = 0.1,
     ack_batch_size: int = 8,
     received_seqs_window: int = 256,
+    reorder_buffer_ttl: float = 500.0,
     # Logging
     logger: LoggerLike | None = None,
 ) -> AggregatingLink:
@@ -45,6 +46,7 @@ async def get_transport(
         ack_flush_interval: Maximum ACK accumulation time before sending.
         ack_batch_size: Maximum number of ACKs in a single flush.
         received_seqs_window: How many recent seqs to store for deduplication.
+        reorder_buffer_ttl: How much time to reorder buffered messages.
         logger: Optional logger instance for debugging and observability.
 
     Returns:
@@ -82,6 +84,7 @@ async def get_transport(
             ack_flush_interval=ack_flush_interval,
             ack_batch_size=ack_batch_size,
             received_seqs_window=received_seqs_window,
+            reorder_buffer_ttl=reorder_buffer_ttl,
             logger=logger,
         )
     else:
@@ -95,6 +98,7 @@ async def get_transport(
             ack_flush_interval=ack_flush_interval,
             ack_batch_size=ack_batch_size,
             received_seqs_window=received_seqs_window,
+            reorder_buffer_ttl=reorder_buffer_ttl,
         )
 
     await high.start()
