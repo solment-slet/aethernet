@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 import msgpack
+from PIL import Image
 
 from aethernet.transport.enums import ReliabilityMode
 from aethernet.exceptions import StreamClosed
@@ -32,12 +33,21 @@ class Frame:
         frame_type: Тип фрейма.
         payload: Полезная нагрузка.
         end: Признак завершения стрима.
+        image: Изображение, None для обычный фреймов
+        protocol: Протокол стрима (например "http", "ws"). Имеет смысл
+            только в ПЕРВОМ frame нового стрима — именно это значение
+            попадёт в accept_stream() на другой стороне. Для всех
+            последующих frame того же stream_id значение игнорируется
+            получателем (стрим уже зарегистрирован). Для image-стримов
+            выставляется автоматически в "image" (см. _IMAGE_PROTOCOL).
     """
 
     stream_id: str
     frame_type: str
     payload: bytes = b""
     end: bool = False
+    image: Image.Image | None = None
+    protocol: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +107,9 @@ class _InFlightPacket:
 _PACKET_MAGIC = b"AGP1"
 _PACKET_HEADER_STRUCT = struct.Struct(">IB")  # seq: uint32, ack_count: uint8
 _ACK_SEQ_STRUCT = struct.Struct(">I")  # один ack_seq: uint32
+_IMG_FRAME_TYPE = "\x00img"  # фрейм-обёртка для входящего изображения
+_IMG_ACK_FRAME_TYPE = "\x00img_ack"  # подтверждение доставки изображения
+_IMAGE_PROTOCOL = "image"  # synthetic protocol для accept_stream() на image-стримах
 
 # Заголовок без ACK и без payload
 _MIN_PACKET_HEADER_SIZE = len(_PACKET_MAGIC) + _PACKET_HEADER_STRUCT.size
@@ -249,6 +262,8 @@ class AggregatingLink:
         self._recv_restart_delay = self._config.min_recv_interval
         self._delay_before_resending = self._config.delay_before_resending
 
+        self._data_loss_subscribers: set[asyncio.Queue[list[int] | None]] = set()
+
         # --- reliability config ---
         self._reliability_mode = reliability_mode
         self._window_size = (
@@ -286,10 +301,18 @@ class AggregatingLink:
 
         self._max_batch_size = min(max_batch_size, self._single_packet_payload_limit)
 
+        self._received_image_uuids: deque[str] = deque(maxlen=64)
+        self._received_image_uuids_set: set[str] = set()
+        self._image_ack_events: dict[str, asyncio.Event] = {}
+
+        self._send_lock: asyncio.Lock = asyncio.Lock()
+
         # --- outgoing / incoming queues ---
         self._outgoing: asyncio.Queue[Frame] = asyncio.Queue()
         self._incoming_by_stream: dict[str, asyncio.Queue[Frame]] = {}
-        self._new_stream_notifications: asyncio.Queue[str] = asyncio.Queue()
+        self._stream_notification_subscribers: set[
+            asyncio.Queue[tuple[str, str] | None]
+        ] = set()
         self._seen_incoming_streams: set[str] = set()
         self._pending_outgoing: Frame | None = None
 
@@ -385,7 +408,15 @@ class AggregatingLink:
             self._closed = True
             self._stop_event.set()
 
-            await asyncio.to_thread(self._transport.low_transport.close)
+            for queue in self._data_loss_subscribers:
+                queue.put_nowait(None)
+            for queue in self._stream_notification_subscribers:
+                queue.put_nowait(None)
+
+            try:
+                await asyncio.to_thread(self._transport.low_transport.close)
+            except Exception:
+                self._logger.exception("Ошибка при закрытии low_transport")
 
             tasks = [
                 t
@@ -397,6 +428,10 @@ class AggregatingLink:
                 )
                 if t is not None
             ]
+            current = asyncio.current_task()
+            if self._shutdown_task is not current:
+                tasks.append(self._shutdown_task)
+
             for task in tasks:
                 task.cancel()
 
@@ -410,10 +445,54 @@ class AggregatingLink:
     # Public API
     # ------------------------------------------------------------------
 
-    async def accept_stream(self) -> str:
+    async def accept_stream(self, protocol: str) -> str:
+        """
+        Ждёт появления нового входящего стрима с указанным protocol.
+
+        protocol сравнивается со значением Frame.protocol, присланным
+        отправителем в первом frame стрима (см. send_frame). Image-стримы
+        сигнализируются с protocol == "image" (см. _IMAGE_PROTOCOL).
+
+        Каждый вызов accept_stream заводит собственную подписку (как
+        iter_data_loss), поэтому несколько параллельных вызовов — в т.ч.
+        ожидающих разные protocol — не воруют уведомления друг у друга:
+        не совпавшее уведомление просто игнорируется этим конкретным
+        вызовом и достаётся следующее.
+
+        Raises:
+            StreamClosed: Если link закрылся до появления подходящего стрима.
+        """
         if not self._started:
             raise RuntimeError("AggregatingLink.start() must be called first")
-        return await self._new_stream_notifications.get()
+
+        queue = self._subscribe_stream_notifications()
+        try:
+            while True:
+                get_task = asyncio.ensure_future(queue.get())
+                stop_task = asyncio.ensure_future(self._stop_event.wait())
+                done, pending = await asyncio.wait(
+                    {get_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:
+                    t.cancel()
+
+                if stop_task in done:
+                    raise StreamClosed("link closed while waiting for a new stream")
+
+                item = get_task.result()
+                if item is None:
+                    raise StreamClosed("link closed while waiting for a new stream")
+
+                stream_id, stream_protocol = item
+                if stream_protocol == protocol:
+                    return stream_id
+
+                self._logger.debug(
+                    f"accept_stream({protocol!r}): skipping stream={stream_id!r} "
+                    f"with protocol={stream_protocol!r}"
+                )
+        finally:
+            self._unsubscribe_stream_notifications(queue)
 
     async def send_frame(
         self,
@@ -422,7 +501,22 @@ class AggregatingLink:
         payload: bytes = b"",
         *,
         end: bool = False,
+        protocol: str | None = None,
     ) -> None:
+        """
+        Отправляет frame в исходящую очередь.
+
+        Args:
+            stream_id: Идентификатор стрима.
+            frame_type: Тип фрейма.
+            payload: Полезная нагрузка.
+            end: Признак завершения стрима.
+            protocol: Указывается только для ПЕРВОГО frame нового стрима —
+                именно это значение получит удалённая сторона в
+                accept_stream(). Для последующих frame того же stream_id
+                можно не указывать: получатель уже знает стрим и значение
+                будет проигнорировано.
+        """
         if self._closed:
             raise RuntimeError("AggregatingLink is closed")
         if not self._started:
@@ -435,6 +529,7 @@ class AggregatingLink:
             frame_type=frame_type,
             payload=bytes(payload),
             end=end,
+            protocol=protocol,
         )
         await self._outgoing.put(frame)
 
@@ -443,12 +538,115 @@ class AggregatingLink:
             raise RuntimeError("AggregatingLink.start() must be called first")
 
         queue = self._incoming_by_stream.setdefault(stream_id, asyncio.Queue())
-        frame = await queue.get()
 
-        if frame.frame_type == "__closed__":
+        get_task = asyncio.ensure_future(queue.get())
+        stop_task = asyncio.ensure_future(self._stop_event.wait())
+        done, pending = await asyncio.wait(
+            {get_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+
+        if stop_task in done:
             raise StreamClosed(f"link closed while waiting for stream {stream_id}")
 
+        frame = get_task.result()
+        if frame.end and queue.empty():
+            self._incoming_by_stream.pop(stream_id, None)
+            self._seen_incoming_streams.discard(stream_id)
         return frame
+
+    async def send_image(self, stream_id: str, image: Image.Image) -> None:
+        """
+        Отправить изображение в поток stream_id.
+
+        stream_id должен быть UUID hex (результат new_stream_id()),
+        потому что UUID используется как идентификатор при передаче.
+
+        В режиме NONE — fire-and-forget.
+        В режимах STOP_AND_WAIT / PARALLEL — ждёт ACK с повторной
+        отправкой каждые delay_before_resending секунд.
+
+        Нельзя вызывать одновременно дважды для одного stream_id.
+        """
+        if self._closed:
+            raise RuntimeError("AggregatingLink is closed")
+        if not self._started:
+            raise RuntimeError("AggregatingLink.start() must be called first")
+        if stream_id in self._image_ack_events:
+            raise RuntimeError(
+                f"Another send_image is already in progress for stream {stream_id!r}"
+            )
+
+        try:
+            img_uuid = uuid.UUID(hex=stream_id)
+        except ValueError:
+            raise ValueError(
+                f"stream_id must be a valid UUID hex string for image transport: {stream_id!r}"
+            )
+
+        if self._reliability_mode == ReliabilityMode.NONE:
+            await self._send_image_physical(image, img_uuid)
+            return
+
+        # ── Reliable mode: Stop-and-Wait на уровне изображений ──────────────
+        ack_event = asyncio.Event()
+        self._image_ack_events[stream_id] = ack_event
+
+        try:
+            first_send = time.monotonic()
+            attempt = 0
+            while not self._stop_event.is_set():
+                await self._send_image_physical(image, img_uuid)
+                attempt += 1
+                if attempt > 1:
+                    self._logger.warning(
+                        f"Image retransmit #{attempt} for stream={stream_id}, "
+                        f"age={time.monotonic() - first_send:.2f}s"
+                    )
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(ack_event.wait()),
+                        timeout=self._delay_before_resending,
+                    )
+                    return  # ACK получен
+                except asyncio.TimeoutError:
+                    continue
+
+        finally:
+            self._image_ack_events.pop(stream_id, None)
+
+    async def recv_image(self, stream_id: str) -> Image.Image:
+        """
+        Получить следующее изображение из потока stream_id.
+
+        Фреймы с данными (frame.image is None), которые придут раньше —
+        кладутся обратно в очередь, чтобы не потерять их для recv_frame.
+
+        Не вызывайте одновременно recv_frame и recv_image на одном stream_id:
+        первый .get() заберёт фрейм из общей очереди, второй его уже не увидит.
+        """
+        pending_data: list[Frame] = []
+        try:
+            while True:
+                frame = await self.recv_frame(stream_id)
+                if frame.image is not None:
+                    return frame.image
+                # Неожиданный data-фрейм на «image-стриме» — буферизуем
+                self._logger.debug(
+                    f"recv_image: non-image frame type={frame.frame_type!r} "
+                    f"on stream {stream_id!r}, buffering"
+                )
+                pending_data.append(frame)
+        finally:
+            # Возвращаем data-фреймы в начало очереди (LIFO-возврат в FIFO-очередь)
+            if pending_data:
+                queue = self._incoming_by_stream.setdefault(stream_id, asyncio.Queue())
+                for f in reversed(pending_data):
+                    # put_nowait безопасен — очередь безлимитная
+                    # noinspection PyProtectedMember
+                    queue._queue.appendleft(f)  # type: ignore[attr-defined]
 
     async def iter_stream(self, stream_id: str) -> AsyncIterator[Frame]:
         while True:
@@ -457,8 +655,122 @@ class AggregatingLink:
             if frame.end:
                 return
 
+    async def _send_image_physical(
+        self, image: Image.Image, img_uuid: uuid.UUID
+    ) -> None:
+        """Отправить изображение с соблюдением min_send_interval."""
+        await self._throttle_send()
+        await asyncio.to_thread(self._transport.send_image, image, img_uuid)
+        self._logger.debug(f"Sent image uuid={img_uuid.hex}")
+
+    def _dispatch_image(self, img_uuid: uuid.UUID, image: Image.Image) -> None:
+        """
+        Вызывается из reader loop когда пришло изображение.
+
+        1. Дедупликация по img_uuid (ретрансмиты от отправителя).
+        2. Создаёт Frame с image и кладёт в очередь стрима.
+        3. Ставит ACK-фрейм в _outgoing (если режим ARQ).
+        """
+        stream_id = img_uuid.hex
+        uuid_key = img_uuid.hex
+
+        is_duplicate = uuid_key in self._received_image_uuids_set
+
+        if is_duplicate:
+            self._logger.debug(
+                f"Duplicate image uuid={uuid_key[:8]}…, "
+                f"dropping payload, re-queueing ACK"
+            )
+        else:
+            # Регистрируем как полученный (скользящее окно 64 UUID)
+            evicted = (
+                self._received_image_uuids[0]
+                if len(self._received_image_uuids) == self._received_image_uuids.maxlen
+                else None
+            )
+            self._received_image_uuids.append(uuid_key)
+            self._received_image_uuids_set.add(uuid_key)
+            if evicted is not None:
+                self._received_image_uuids_set.discard(evicted)
+
+            # Кладём image-фрейм в очередь стрима
+            frame = Frame(
+                stream_id=stream_id,
+                frame_type=_IMG_FRAME_TYPE,
+                image=image,
+                protocol=_IMAGE_PROTOCOL,
+            )
+            self._dispatch_frame(frame)
+            self._logger.debug(f"Dispatched image uuid={uuid_key[:8]}… to stream {stream_id!r}")
+
+        # ACK отправляем в любом случае (дубликат или нет) — отправитель мог
+        # не получить предыдущий ACK и поэтому ретрансмитит
+        if self._reliability_mode != ReliabilityMode.NONE:
+            ack_frame = Frame(
+                stream_id=stream_id,
+                frame_type=_IMG_ACK_FRAME_TYPE,
+            )
+            self._outgoing.put_nowait(ack_frame)
+            self._logger.debug(f"Queued IMG_ACK for uuid={uuid_key[:8]}…")
+
+    def _subscribe_data_loss(self) -> asyncio.Queue[list[int] | None]:
+        """Регистрирует нового подписчика на data-loss события."""
+        queue: asyncio.Queue[list[int] | None] = asyncio.Queue()
+        self._data_loss_subscribers.add(queue)
+        return queue
+
+    def _unsubscribe_data_loss(self, queue: asyncio.Queue[list[int] | None]) -> None:
+        self._data_loss_subscribers.discard(queue)
+
+    def _subscribe_stream_notifications(
+        self,
+    ) -> asyncio.Queue[tuple[str, str] | None]:
+        """Регистрирует нового подписчика на уведомления о новых стримах."""
+        queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+        self._stream_notification_subscribers.add(queue)
+        return queue
+
+    def _unsubscribe_stream_notifications(
+        self, queue: asyncio.Queue[tuple[str, str] | None]
+    ) -> None:
+        self._stream_notification_subscribers.discard(queue)
+
+    async def iter_data_loss(self) -> AsyncIterator[list[int]]:
+        """
+        Асинхронный итератор по событиям потери данных.
+
+        Каждый вызов iter_data_loss() создаёт независимую подписку —
+        несколько одновременных подписчиков получают одно и то же
+        событие, не "съедая" его друг у друга (в отличие от единого
+        общего Event). Автоматически отписывается при выходе из
+        генератора (break, return, отмена, GeneratorExit).
+
+        Yields:
+            Список seq пакетов, отброшенных из reorder buffer по TTL.
+            Не 100% гарантия потери данных именно в текущем стриме —
+            гарантия того, что *какой-то* batch был безвозвратно отброшен.
+        """
+        queue = self._subscribe_data_loss()
+        try:
+            while True:
+                seqs = await queue.get()
+                if seqs is None:  # сигнал закрытия линка
+                    return
+                yield seqs
+        finally:
+            self._unsubscribe_data_loss(queue)
+
     @staticmethod
     def new_stream_id() -> str:
+        """
+        Генерирует новый stream_id.
+
+        Формат — чистый uuid4 hex без префиксов: это единственный формат,
+        который понимает send_image()/recv_image() (uuid.UUID(hex=stream_id)),
+        поэтому он используется одинаково и для обычных, и для image-стримов.
+        Protocol стрима передаётся отдельно — через Frame.protocol в первом
+        frame (см. send_frame / accept_stream).
+        """
         return uuid.uuid4().hex
 
     # ------------------------------------------------------------------
@@ -485,6 +797,20 @@ class AggregatingLink:
 
                 try:
                     if self._reliability_mode == ReliabilityMode.NONE:
+                        # ── изображение от medium_transport ──────────────────────────────────
+                        if isinstance(raw_packet, tuple):
+                            image, img_uuid = raw_packet
+                            self._logger.debug(
+                                f"recv image: uuid={img_uuid.hex[:8]}…, "
+                                f"size={image.size}"
+                            )
+                            self._dispatch_image(img_uuid, image)
+                            self._cleanup_stale_chunk_assemblies()
+                            self._cleanup_stale_reorder_buffer()
+                            if self._recv_restart_delay > 0:
+                                await asyncio.sleep(self._recv_restart_delay)
+                            continue
+
                         logical_payloads = self._decode_legacy_transport_packet(
                             raw_packet
                         )
@@ -526,14 +852,37 @@ class AggregatingLink:
             raise
 
     def _dispatch_frame(self, frame: Frame) -> None:
-        """Кладёт frame в очередь нужного стрима и уведомляет о новом стриме."""
+        """
+        Кладёт frame в очередь нужного стрима и, если стрим новый,
+        рассылает (stream_id, protocol) всем подписчикам accept_stream().
+        """
+        # ── перехват внутреннего IMG_ACK ─────────────────────────────────────
+        if frame.frame_type == _IMG_ACK_FRAME_TYPE:
+            event = self._image_ack_events.get(frame.stream_id)
+            if event is not None:
+                self._logger.debug(f"IMG_ACK received for stream={frame.stream_id!r}")
+                event.set()
+            else:
+                self._logger.debug(
+                    f"IMG_ACK for stream={frame.stream_id!r} — no waiter (already acked?)"
+                )
+            return  # не попадает в пользовательскую очередь
+
+        # ── обычная маршрутизация ─────────────────────────────────────────────
         is_new_stream = frame.stream_id not in self._incoming_by_stream
         queue = self._incoming_by_stream.setdefault(frame.stream_id, asyncio.Queue())
         queue.put_nowait(frame)
 
         if is_new_stream and frame.stream_id not in self._seen_incoming_streams:
             self._seen_incoming_streams.add(frame.stream_id)
-            self._new_stream_notifications.put_nowait(frame.stream_id)
+            protocol = frame.protocol or ""
+            if not frame.protocol:
+                self._logger.warning(
+                    f"New stream={frame.stream_id!r} without protocol in first frame; "
+                    f"accept_stream() filters won't match it unless they ask for protocol=''"
+                )
+            for sub_queue in self._stream_notification_subscribers:
+                sub_queue.put_nowait((frame.stream_id, protocol))
 
     def _decode_agp1_packet(self, raw: bytes) -> tuple[list[bytes], list[int]]:
         """
@@ -624,13 +973,18 @@ class AggregatingLink:
             self._logger.warning(f"Dropping stale reorder buffer entry: seq={seq}")
             del self._reorder_buffer[seq]
 
-        # Если удалили seq который блокировал flush — продвигаем next_expected_seq
-        # чтобы не застрять навсегда. Пропускаем до следующего имеющегося или +1.
-        if stale and self._next_expected_seq in [s for s in stale]:
+        if stale and self._next_expected_seq in stale:
             if self._reorder_buffer:
                 self._next_expected_seq = min(self._reorder_buffer)
             else:
                 self._next_expected_seq = max(stale) + 1
+
+            self._logger.error(
+                f"Reorder buffer gap: {len(stale)} batch(es) permanently lost, "
+                f"data corruption possible for active streams"
+            )
+            for queue in self._data_loss_subscribers:
+                queue.put_nowait(list(stale))
 
     def _process_incoming_acks(self, ack_seqs: list[int]) -> None:
         """
@@ -720,6 +1074,8 @@ class AggregatingLink:
 
         seq = self._seq_counter
         self._seq_counter += 1
+        if self._seq_counter > 0xFFFFFFFF:
+            self._seq_counter = 1
 
         ack_seqs = self._drain_pending_acks()
         packet = _build_packet(seq, ack_seqs, logical_payload)
@@ -755,6 +1111,22 @@ class AggregatingLink:
                 f"size={len(packet)}, prefix={packet[:32].hex()}"
             )
             await self._send_physical_packet(packet)
+
+    async def _throttle_send(self) -> None:
+        """
+        Гарантирует min_send_interval между физическими send, независимо
+        от того, откуда вызов — _send_physical_packet или
+        _send_image_physical. Использует lock, чтобы конкурентные вызовы
+        (например send_frame из writer loop и send_image из пользовательской
+        задачи) не считали wait от одного и того же устаревшего
+        _last_send_ts.
+        """
+        async with self._send_lock:
+            now = time.monotonic()
+            wait = self._min_send_interval - (now - self._last_send_ts)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_send_ts = time.monotonic()
 
     # ------------------------------------------------------------------
     # Retransmit loop
@@ -870,14 +1242,9 @@ class AggregatingLink:
 
     async def _send_physical_packet(self, packet: bytes) -> None:
         """Отправляет ОДИН physical packet строго соблюдая min_send_interval."""
-        now = time.monotonic()
-        wait_more = self._min_send_interval - (now - self._last_send_ts)
-        if wait_more > 0:
-            self._logger.debug(f"Waiting {wait_more:.3f}s before next physical send")
-            await asyncio.sleep(wait_more)
-
+        await self._throttle_send()
         await asyncio.to_thread(self._transport.send, packet)
-        self._last_send_ts = time.monotonic()
+        self._logger.debug("Sent package")
 
     # ------------------------------------------------------------------
     # Legacy encoding / decoding (режим NONE)
@@ -978,6 +1345,7 @@ class AggregatingLink:
                 "t": frame.frame_type,
                 "p": frame.payload,
                 "e": frame.end,
+                "pr": frame.protocol,
             }
             for frame in frames
         ]
@@ -999,6 +1367,7 @@ class AggregatingLink:
             frame_type = item["t"]
             payload = item.get("p", b"")
             end = bool(item.get("e", False))
+            protocol = item.get("pr")
 
             if not isinstance(stream_id, str):
                 raise ValueError("stream_id must be str")
@@ -1006,6 +1375,8 @@ class AggregatingLink:
                 raise ValueError("frame_type must be str")
             if not isinstance(payload, (bytes, bytearray)):
                 raise ValueError("payload must be bytes")
+            if protocol is not None and not isinstance(protocol, str):
+                raise ValueError("protocol must be str or None")
 
             frames.append(
                 Frame(
@@ -1013,6 +1384,7 @@ class AggregatingLink:
                     frame_type=frame_type,
                     payload=bytes(payload),
                     end=end,
+                    protocol=protocol,
                 )
             )
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import uuid
 import os
 import logging
 import time
 
 import basex
+from PIL import Image
 from Crypto.Cipher import ChaCha20_Poly1305, AES
 from Crypto.Cipher._mode_gcm import GcmMode
 from Crypto.Cipher._mode_eax import EaxMode
@@ -18,17 +20,17 @@ from aethernet.typing import LoggerLike
 
 class MediumTransport:
     """
-    Средний уровень транспорта:
-    - шифрование (опционально)
-    - basex-кодирование
-    - расчёт максимального payload размера
+    Middle transport layer:
+    - encryption (optional)
+    - basex encoding
+    - maximum payload size calculation
 
-    Гарантия:
-        Для любого payload длины <= max_payload_bytes
+    Guarantee:
+        For any payload of length <= max_payload_bytes
         len(encoded) <= max_message_chars
     """
 
-    # Размеры nonce/tag для разных алгоритмов
+    # Nonce/tag sizes for different algorithms
     _CHACHA_NONCE = 12
     _CHACHA_TAG = 16
 
@@ -59,17 +61,17 @@ class MediumTransport:
         self._encryption_mode = encryption_mode
         self._key: bytes = encryption_key if encryption_key is not None else b""
 
-        if self._encryption_mode != EncryptionMode.NONE and not self._key:
-            raise ValueError("encryption_key required for selected encryption_mode")
-
         self._basex = basex.init(alphabet=self.config.alphabet)
         self.max_message_chars = self.config.max_message_chars
 
-        self.max_payload_bytes = (
-            self._calc_max_payload_bytes()
-            if self._mode == "string" and self.config.max_message_bytes is None
-            else self.config.max_message_bytes
-        )
+        if self._mode == "string" and self.config.max_message_bytes is None:
+            self.max_payload_bytes = self._calc_max_payload_bytes()
+        elif self.config.max_message_bytes is not None:
+            self.max_payload_bytes = self.config.max_message_bytes
+        else:
+            raise ValueError(
+                "max_message_bytes must be set in config when mode is not 'string'"
+            )
 
         logger.debug(
             f"{self._mode=}\n"
@@ -85,27 +87,42 @@ class MediumTransport:
         encoded = self._encode(data)
         self.low_transport.send(encoded)
 
-    def recv(self, recv_restart_delay: float = 0.01) -> bytes:
+    def send_image(self, image: Image.Image, stream_id: uuid.UUID) -> None:
+        self.low_transport.send((image, stream_id))
+
+    def recv(self, recv_restart_delay: float = 0.01) -> bytes | tuple[Image.Image, uuid.UUID]:
         while True:
             try:
-                text = self.low_transport.recv()
-                break
+                data = self.low_transport.recv()
+                # ── image tuple ──────────────────────────────────────────────
+                if (
+                        isinstance(data, tuple)
+                        and len(data) == 2
+                        and isinstance(data[0], Image.Image)
+                        and isinstance(data[1], uuid.UUID)
+                ):
+                    return data  # (Image.Image, uuid.UUID) — пробрасываем как есть
+                # ── bytes / str ──────────────────────────────────────────────
+                if isinstance(data, (str, bytes)):
+                    break
+                self._logger.warning(
+                    f"Invalid type {type(data).__name__!r} received from low_transport.recv"
+                )
+                continue
             except TransportClosedError:
                 raise
             except Exception:
-                self._logger.exception(
-                    "Ошибка при получении сообщения от low_transport"
-                )
+                self._logger.exception("Error receiving message from low_transport")
                 time.sleep(recv_restart_delay)
 
-        return self._decode(text)
+        return self._decode(data)  # type: ignore[arg-type]
 
     # ============================================================
     # Encryption
     # ============================================================
 
     def _make_cipher(self, nonce: bytes) -> ChaCha20Poly1305Cipher | GcmMode | EaxMode:
-        """Создаёт cipher-объект для текущего режима шифрования."""
+        """Creates a cipher object for the current encryption mode."""
         if self._encryption_mode == EncryptionMode.CHACHA20_POLY1305:
             return ChaCha20_Poly1305.new(key=self._key, nonce=nonce)
         if self._encryption_mode == EncryptionMode.AES_GCM:
@@ -117,13 +134,8 @@ class MediumTransport:
     def _encryption_overhead(self) -> int:
         if self._encryption_mode == EncryptionMode.NONE:
             return 0
-        if self._encryption_mode == EncryptionMode.CHACHA20_POLY1305:
-            return self._CHACHA_NONCE + self._CHACHA_TAG
-        if self._encryption_mode == EncryptionMode.AES_GCM:
-            return self._AES_GCM_NONCE + self._AES_GCM_TAG
-        if self._encryption_mode == EncryptionMode.AES_EAX:
-            return self._AES_EAX_NONCE + self._AES_EAX_TAG
-        raise ValueError("Unsupported encryption mode")
+        nonce_size, tag_size = self._OVERHEAD[self._encryption_mode]
+        return nonce_size + tag_size
 
     def _encode(self, data: bytes) -> str | bytes:
         if self._encryption_mode == EncryptionMode.NONE:
@@ -155,21 +167,23 @@ class MediumTransport:
         return self._make_cipher(nonce).decrypt_and_verify(ciphertext, tag)
 
     # ============================================================
-    # Size calculation (математически корректный)
+    # Size calculation (mathematically correct)
     # ============================================================
 
     def _encode_for_size(self, data_len: int) -> int:
         """
-        Возвращает длину basex-строки для worst-case payload.
+        Returns the basex-encoded string length for a worst-case payload.
         """
         payload_len = self._encryption_overhead() + data_len
-        worst_payload = b"\xff" * payload_len
-        return len(self._basex.encode(worst_payload))
+        return max(
+            len(self._basex.encode(b"\x00" * payload_len)),
+            len(self._basex.encode(b"\xff" * payload_len)),
+        )
 
     def _calc_max_payload_bytes(self) -> int:
         """
-        Находит максимальный payload, который точно помещается
-        в max_message_chars (tight bound).
+        Finds the maximum payload that is guaranteed to fit
+        within max_message_chars (tight bound).
         """
         if self.max_message_chars is None:
             raise ValueError(
@@ -179,7 +193,7 @@ class MediumTransport:
         C = self.max_message_chars
 
         low = 0
-        high = C  # грубая верхняя граница (точно не больше)
+        high = C  # rough upper bound (definitely not larger)
 
         while low < high:
             mid = (low + high + 1) // 2
@@ -199,7 +213,7 @@ class MediumTransport:
     def _validate_key(key: bytes | None, mode: EncryptionMode) -> None:
         if mode == EncryptionMode.NONE:
             return
-        if key is None:
+        if not key:
             raise ValueError("encryption_key required for selected encryption_mode")
         if mode == EncryptionMode.CHACHA20_POLY1305 and len(key) != 32:
             raise ValueError("ChaCha20-Poly1305 requires 32-byte key")

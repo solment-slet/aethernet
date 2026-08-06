@@ -5,7 +5,7 @@ class ReliabilityMode(Enum):
     """Режим надёжности доставки физических пакетов."""
 
     NONE = "none"
-    """Без подтверждений — поведение как в оригинале."""
+    """Без подтверждений."""
 
     STOP_AND_WAIT = "stop_and_wait"
     """Классический Stop-and-Wait ARQ (window_size=1)."""

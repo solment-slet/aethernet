@@ -7,6 +7,7 @@ import websockets
 
 from aethernet.transport import AggregatingLink
 from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
+from aethernet.transport.ws_over_link.ws_over_link import PROTOCOL_NAME
 
 
 class LinkWebSocketProxyServer:
@@ -37,7 +38,7 @@ class LinkWebSocketProxyServer:
 
     async def _dispatcher_loop(self) -> None:
         while not self._closed:
-            stream_id = await self._link.accept_stream()
+            stream_id = await self._link.accept_stream(PROTOCOL_NAME)
             asyncio.create_task(
                 self._try_handle_stream(stream_id), name=f"ws_proxy.{stream_id}"
             )

@@ -18,6 +18,7 @@ from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
 
 HeadersLike = Any
 
+PROTOCOL_NAME = "ws"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -254,6 +255,7 @@ class _WebSocketConnector:
             stream_id,
             "meta",
             encode_json_bytes({"kind": "ws_open", "uri": self._uri, **self._params}),
+            protocol=PROTOCOL_NAME,
         )
 
         first = await self._link.recv_frame(stream_id)

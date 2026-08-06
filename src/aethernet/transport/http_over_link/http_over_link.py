@@ -8,6 +8,8 @@ import httpx
 from aethernet.transport import AggregatingLink
 from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
 
+PROTOCOL_NAME = "http"
+
 # =========================
 # Общие сериализаторы
 # =========================
@@ -174,6 +176,7 @@ class AethernetHttpx(httpx.AsyncBaseTransport):
             stream_id,
             "meta",
             encode_json_bytes(request_start),
+            protocol=PROTOCOL_NAME,
         )
 
         if body:
@@ -291,7 +294,7 @@ class LinkHTTPProxyServer:
 
     async def _dispatcher_loop(self) -> None:
         while not self._closed:
-            stream_id = await self._link.accept_stream()
+            stream_id = await self._link.accept_stream(PROTOCOL_NAME)
             asyncio.create_task(
                 self._handle_stream(stream_id),
                 name=f"LinkHTTPProxyServer.stream.{stream_id}",
