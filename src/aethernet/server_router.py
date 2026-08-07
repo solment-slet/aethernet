@@ -8,7 +8,7 @@ import logging
 import httpx
 import websockets
 
-from aethernet.transport.stack import get_transport
+from aethernet.transport.stack import get_link
 from aethernet.transport.enums import EncryptionMode, ReliabilityMode
 from aethernet.transport import LowTransport, AggregatingLink
 from aethernet.typing import LoggerLike
@@ -358,7 +358,7 @@ class AethernetServer(ServerRouter):
         # Logging
         logger: LoggerLike = logging.getLogger(),
     ) -> AethernetServer:
-        transport = await get_transport(
+        transport = await get_link(
             low_transport,
             encryption_mode=encryption_mode,
             encryption_key=encryption_key,

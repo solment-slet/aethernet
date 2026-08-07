@@ -31,7 +31,7 @@ tests = [
 lint = [
     "ruff>=0.15,<1",
     "black>=26.3,<27",
-    "mypy>=1.20,<2"
+    "mypy>=1.20,<2",
 ]
 
 build = [

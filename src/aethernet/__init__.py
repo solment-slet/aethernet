@@ -3,7 +3,7 @@ from aethernet.transport.ws_over_link import AethernetWebSockets
 from aethernet.transport.http_over_link import AethernetHttpx
 from aethernet.server_router import AethernetServer
 from aethernet.transport.low_transport import LowTransport, LowTransportConfig
-from aethernet.transport.stack import get_transport
+from aethernet.transport.stack import get_link
 
 __all__ = [
     "EncryptionMode",
@@ -13,5 +13,5 @@ __all__ = [
     "AethernetHttpx",
     "AethernetServer",
     "LowTransport",
-    "get_transport",
+    "get_link",
 ]

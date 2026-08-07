@@ -54,7 +54,7 @@ from aethernet import (
     ReliabilityMode,
     LowTransport,
     LowTransportConfig,
-    get_transport,
+    get_link,
     AethernetHttpx,
     AethernetWebSockets,
     AethernetServer,
@@ -138,18 +138,17 @@ import asyncio
 import secrets
 import httpx
 from aethernet import (
-    get_transport,
+    get_link,
     AethernetWebSockets,
     EncryptionMode,
     ReliabilityMode,
 )
 
-
 SHARED_KEY = secrets.token_bytes(32)  # generate once, share securely
 
 
 async def main() -> None:
-    link = await get_transport(
+    link = await get_link(
         MyTransport(),
         encryption_mode=EncryptionMode.CHACHA20_POLY1305,
         encryption_key=SHARED_KEY,

@@ -230,6 +230,7 @@ class AggregatingLink:
         chunk_assembly_ttl: float = 60.0,
         # --- reliability ---
         reliability_mode: ReliabilityMode = ReliabilityMode.NONE,
+        image_reliability_mode: ReliabilityMode = ReliabilityMode.NONE,
         window_size: int = 8,
         ack_flush_interval: float = 0.1,
         ack_batch_size: int = 8,
@@ -243,6 +244,12 @@ class AggregatingLink:
             max_batch_size: Максимальный размер logical batch в байтах.
             chunk_assembly_ttl: Время жизни незавершённой сборки chunk-пакетов.
             reliability_mode: Режим надёжности доставки.
+            image_reliability_mode: Режим надёжности для send_image()/recv_image(),
+                независимый от reliability_mode. По умолчанию NONE (fire-and-forget) —
+                разумно для видеопотока с высоким FPS, где актуальность важнее
+                гарантии доставки. Можно поставить STOP_AND_WAIT/PARALLEL, если
+                отдельные изображения должны доставляться гарантированно
+                (см. также override-аргумент reliability_mode в самом send_image()).
             window_size: Размер окна для режима PARALLEL.
             ack_flush_interval: Максимальное время накопления ACK перед отправкой.
             ack_batch_size: Максимальное количество ACK в одном flush.
@@ -266,6 +273,7 @@ class AggregatingLink:
 
         # --- reliability config ---
         self._reliability_mode = reliability_mode
+        self._image_reliability_mode = image_reliability_mode
         self._window_size = (
             1 if reliability_mode == ReliabilityMode.STOP_AND_WAIT else window_size
         )
@@ -563,17 +571,26 @@ class AggregatingLink:
         stream_id должен быть UUID hex (результат new_stream_id()),
         потому что UUID используется как идентификатор при передаче.
 
+        Режим надёжности берётся из self._image_reliability_mode (задаётся
+        в конструкторе через image_reliability_mode), независимо от
+        self._reliability_mode для обычных data-фреймов.
+
         В режиме NONE — fire-and-forget.
         В режимах STOP_AND_WAIT / PARALLEL — ждёт ACK с повторной
         отправкой каждые delay_before_resending секунд.
 
-        Нельзя вызывать одновременно дважды для одного stream_id.
+        Нельзя вызывать одновременно дважды для одного stream_id, если
+        image_reliability_mode — не NONE.
         """
         if self._closed:
             raise RuntimeError("AggregatingLink is closed")
         if not self._started:
             raise RuntimeError("AggregatingLink.start() must be called first")
-        if stream_id in self._image_ack_events:
+
+        if (
+                self._image_reliability_mode != ReliabilityMode.NONE
+                and stream_id in self._image_ack_events
+        ):
             raise RuntimeError(
                 f"Another send_image is already in progress for stream {stream_id!r}"
             )
@@ -585,7 +602,7 @@ class AggregatingLink:
                 f"stream_id must be a valid UUID hex string for image transport: {stream_id!r}"
             )
 
-        if self._reliability_mode == ReliabilityMode.NONE:
+        if self._image_reliability_mode == ReliabilityMode.NONE:
             await self._send_image_physical(image, img_uuid)
             return
 
@@ -700,12 +717,15 @@ class AggregatingLink:
                 image=image,
                 protocol=_IMAGE_PROTOCOL,
             )
-            self._dispatch_frame(frame)
+            self._dispatch_image_frame(frame)
             self._logger.debug(f"Dispatched image uuid={uuid_key[:8]}… to stream {stream_id!r}")
 
         # ACK отправляем в любом случае (дубликат или нет) — отправитель мог
-        # не получить предыдущий ACK и поэтому ретрансмитит
-        if self._reliability_mode != ReliabilityMode.NONE:
+        # не получить предыдущий ACK и поэтому ретрансмитит.
+        # Условие завязано на image_reliability_mode (а не на общий
+        # reliability_mode для data-фреймов), так как send_image()/recv_image()
+        # используют свой независимый режим надёжности.
+        if self._image_reliability_mode != ReliabilityMode.NONE:
             ack_frame = Frame(
                 stream_id=stream_id,
                 frame_type=_IMG_ACK_FRAME_TYPE,
@@ -795,22 +815,25 @@ class AggregatingLink:
                     await asyncio.sleep(self._recv_restart_delay)
                     continue
 
+                # ── изображение от medium_transport ──────────────────────────────
+                # Проверяется ДО ветвления по self._reliability_mode: формат
+                # входящего изображения не зависит от режима надёжности
+                # обычных data-фреймов, у него свой независимый
+                # self._image_reliability_mode.
+                if isinstance(raw_packet, tuple):
+                    image, img_uuid = raw_packet
+                    self._logger.debug(
+                        f"recv image: uuid={img_uuid.hex[:8]}…, size={image.size}"
+                    )
+                    self._dispatch_image(img_uuid, image)
+                    self._cleanup_stale_chunk_assemblies()
+                    self._cleanup_stale_reorder_buffer()
+                    if self._recv_restart_delay > 0:
+                        await asyncio.sleep(self._recv_restart_delay)
+                    continue
+
                 try:
                     if self._reliability_mode == ReliabilityMode.NONE:
-                        # ── изображение от medium_transport ──────────────────────────────────
-                        if isinstance(raw_packet, tuple):
-                            image, img_uuid = raw_packet
-                            self._logger.debug(
-                                f"recv image: uuid={img_uuid.hex[:8]}…, "
-                                f"size={image.size}"
-                            )
-                            self._dispatch_image(img_uuid, image)
-                            self._cleanup_stale_chunk_assemblies()
-                            self._cleanup_stale_reorder_buffer()
-                            if self._recv_restart_delay > 0:
-                                await asyncio.sleep(self._recv_restart_delay)
-                            continue
-
                         logical_payloads = self._decode_legacy_transport_packet(
                             raw_packet
                         )
@@ -883,6 +906,38 @@ class AggregatingLink:
                 )
             for sub_queue in self._stream_notification_subscribers:
                 sub_queue.put_nowait((frame.stream_id, protocol))
+
+    def _dispatch_image_frame(self, frame: Frame) -> None:
+        """
+        Как _dispatch_frame, но для image-фреймов: если в очереди стрима уже
+        лежит непрочитанный image-фрейм — он удаляется перед вставкой нового.
+
+        Гарантирует, что в очереди image-стрима одновременно лежит не более
+        одного изображения (UDP-like поведение: RAM не растёт, потребитель
+        всегда получает самое свежее, а не застрявшее старое).
+        """
+        stream_id = frame.stream_id
+        is_new_stream = stream_id not in self._incoming_by_stream
+        queue = self._incoming_by_stream.setdefault(stream_id, asyncio.Queue())
+
+        # noinspection PyProtectedMember
+        dq = queue._queue  # type: ignore[attr-defined]
+        for i, existing in enumerate(dq):
+            if existing.image is not None:
+                del dq[i]
+                self._logger.debug(
+                    f"Dropped stale queued image for stream={stream_id!r} "
+                    f"(consumer too slow)"
+                )
+                break
+
+        queue.put_nowait(frame)
+
+        if is_new_stream and stream_id not in self._seen_incoming_streams:
+            self._seen_incoming_streams.add(stream_id)
+            protocol = frame.protocol or ""
+            for sub_queue in self._stream_notification_subscribers:
+                sub_queue.put_nowait((stream_id, protocol))
 
     def _decode_agp1_packet(self, raw: bytes) -> tuple[list[bytes], list[int]]:
         """

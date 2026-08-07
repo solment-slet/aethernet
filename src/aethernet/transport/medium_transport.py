@@ -96,10 +96,10 @@ class MediumTransport:
                 data = self.low_transport.recv()
                 # ── image tuple ──────────────────────────────────────────────
                 if (
-                        isinstance(data, tuple)
-                        and len(data) == 2
-                        and isinstance(data[0], Image.Image)
-                        and isinstance(data[1], uuid.UUID)
+                    isinstance(data, tuple)
+                    and len(data) == 2
+                    and isinstance(data[0], Image.Image)
+                    and isinstance(data[1], uuid.UUID)
                 ):
                     return data  # (Image.Image, uuid.UUID) — пробрасываем как есть
                 # ── bytes / str ──────────────────────────────────────────────

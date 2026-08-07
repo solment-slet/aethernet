@@ -1,13 +1,12 @@
 import uuid
-from typing import Literal, Generic, TypeVar, Any, get_args, get_origin
 from abc import ABC, ABCMeta, abstractmethod
 from dataclasses import dataclass
+from typing import Any, Generic, Literal, TypeVar, get_args, get_origin
 
 from PIL import Image
 
-# aliases
-str_and_images = str | tuple[Image.Image, uuid.UUID]
-bytes_and_images = bytes | tuple[Image.Image, uuid.UUID]
+type StrAndImages = str | tuple[Image.Image, uuid.UUID]
+type BytesAndImages = bytes | tuple[Image.Image, uuid.UUID]
 
 _BASE_CLASS = None
 
@@ -15,10 +14,9 @@ TransportData = TypeVar(
     'TransportData',
     str,
     bytes,
-    str_and_images,
-    bytes_and_images,
+    StrAndImages,
+    BytesAndImages,
 )
-
 
 @dataclass(slots=True)
 class LowTransportConfig:
@@ -70,7 +68,7 @@ class LowTransportMeta(ABCMeta):
             return set(get_args(t)) if get_origin(t) is Literal or get_origin(t) is type(str | int) else {t}
 
         if config.supports_images:
-            allowed_image_types = [str_and_images, bytes_and_images]
+            allowed_image_types = [StrAndImages, BytesAndImages]
             # Normalise the provided type into a set so that Union order (A | B vs B | A) does not break the check
             actual_set = _to_set(generic_type)
 

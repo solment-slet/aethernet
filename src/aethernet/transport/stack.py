@@ -6,7 +6,7 @@ from aethernet.transport import AggregatingLink, MediumTransport
 from aethernet.typing import LoggerLike
 
 
-async def get_transport(
+async def get_link(
     low_transport: LowTransport,
     *,
     # Encryption
@@ -18,6 +18,7 @@ async def get_transport(
     chunk_assembly_ttl: float = 60.0,
     # Reliability
     reliability_mode: ReliabilityMode = ReliabilityMode.NONE,
+    image_reliability_mode: ReliabilityMode = ReliabilityMode.NONE,
     window_size: int = 8,
     ack_flush_interval: float = 0.1,
     ack_batch_size: int = 8,
@@ -42,6 +43,7 @@ async def get_transport(
         max_batch_size: Maximum logical batch size in bytes.
         chunk_assembly_ttl: Lifetime of an incomplete chunk assembly.
         reliability_mode: Delivery reliability mode.
+        image_reliability_mode: Image delivery reliability mode.
         window_size: Window size for PARALLEL mode.
         ack_flush_interval: Maximum ACK accumulation time before sending.
         ack_batch_size: Maximum number of ACKs in a single flush.
@@ -80,6 +82,7 @@ async def get_transport(
             max_batch_size=max_batch_size,
             chunk_assembly_ttl=chunk_assembly_ttl,
             reliability_mode=reliability_mode,
+            image_reliability_mode=image_reliability_mode,
             window_size=window_size,
             ack_flush_interval=ack_flush_interval,
             ack_batch_size=ack_batch_size,
@@ -94,6 +97,7 @@ async def get_transport(
             max_batch_size=max_batch_size,
             chunk_assembly_ttl=chunk_assembly_ttl,
             reliability_mode=reliability_mode,
+            image_reliability_mode=image_reliability_mode,
             window_size=window_size,
             ack_flush_interval=ack_flush_interval,
             ack_batch_size=ack_batch_size,

@@ -1,17 +1,21 @@
-# --- Remote Client Errors ---
+# --- Local Device Errors ---
 
-class ClientError(Exception):
-    """Base exception for the remote client."""
-
-
-class ProtocolError(ClientError):
-    """The remote host sent an invalid or unexpected protocol message."""
+class LocalDeviceError(Exception):
+    """Base exception for the local device."""
 
 
-# --- Remote Server Errors ---
+class LocalDeviceProtocolError(LocalDeviceError):
+    """The remote device sent an invalid or unexpected protocol message."""
 
-class ServerError(ClientError):
-    """Errors sent by the remote host."""
+
+class NotConnectedError(LocalDeviceError):
+    """The client is not connected to a remote device."""
+
+
+# --- Remote Device Errors ---
+
+class RemoteDeviceError(LocalDeviceError):
+    """Errors sent by the remote device."""
     def __init__(self, *, reason: str | None = None, message: str | None = None) -> None:
         reason = "unknown_error" if reason is None else reason
         message = "Unknown Error" if message is None else message
@@ -20,9 +24,17 @@ class ServerError(ClientError):
         super().__init__(message)
 
 
-class ServerProtocolError(ServerError):
-    """The remote server reports that the client has sent an invalid or unexpected protocol message."""
+class RemoteDeviceProtocolError(RemoteDeviceError):
+    """The remote device reports that the client has sent an invalid or unexpected protocol message."""
 
 
-class ConnectionRejectedError(ServerError):
-    """The remote host rejected the connection request."""
+class ConnectionRejectedError(RemoteDeviceError):
+    """The remote device rejected the connection request."""
+
+
+class InvalidSessionError(RemoteDeviceError):
+    """The session ID is missing or invalid."""
+
+
+class InternalError(RemoteDeviceError):
+    """The remote device encountered an internal error."""
