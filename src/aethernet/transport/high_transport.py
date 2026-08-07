@@ -14,7 +14,7 @@ import msgpack
 from PIL import Image
 
 from aethernet.transport.enums import ReliabilityMode
-from aethernet.exceptions import StreamClosed
+from aethernet.exceptions import StreamClosed, TransportClosedError
 from aethernet.typing import LoggerLike
 from aethernet.transport.medium_transport import MediumTransport
 
@@ -290,7 +290,7 @@ class AggregatingLink:
             self.SINGLE_MAGIC
         )
         self._chunk_packet_payload_limit = (
-            self._transport_limit - len(self.CHUNK_MAGIC) - self._CHUNK_META_STRUCT.size
+                self._transport_limit - len(self.CHUNK_MAGIC) - self._CHUNK_META_STRUCT.size
         )
         self._agp1_payload_limit = self._transport_limit - _MIN_PACKET_HEADER_SIZE
 
@@ -307,7 +307,24 @@ class AggregatingLink:
                 "transport.max_payload_bytes too small for AGP1 packet framing"
             )
 
-        self._max_batch_size = min(max_batch_size, self._single_packet_payload_limit)
+        # Для AGP1 в физический пакет помимо logical_payload попадают ещё
+        # piggyback-ACK (до ack_batch_size штук по _ACK_SEQ_STRUCT.size байт).
+        # Резервируем под них место заранее, иначе при большом batch_size
+        # + полном наборе ACK физический пакет может превысить
+        # transport.max_payload_bytes — а chunking для AGP1 не реализован.
+        self._agp1_max_logical_payload = (
+                self._agp1_payload_limit - ack_batch_size * _ACK_SEQ_STRUCT.size
+        ) + 64 # страховка
+        if self._agp1_max_logical_payload <= 0:
+            raise ValueError(
+                "transport.max_payload_bytes too small for AGP1 framing "
+                "with the configured ack_batch_size"
+            )
+
+        if reliability_mode == ReliabilityMode.NONE:
+            self._max_batch_size = min(max_batch_size, self._single_packet_payload_limit)
+        else:
+            self._max_batch_size = min(max_batch_size, self._agp1_max_logical_payload)
 
         self._received_image_uuids: deque[str] = deque(maxlen=64)
         self._received_image_uuids_set: set[str] = set()
@@ -369,6 +386,10 @@ class AggregatingLink:
             f"reliability={reliability_mode.value}, window_size={self._window_size}, "
             f"agp1_payload_limit={self._agp1_payload_limit}"
         )
+
+    @property
+    def image_reliability_mode(self) -> ReliabilityMode:
+        return self._image_reliability_mode
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -526,7 +547,7 @@ class AggregatingLink:
                 будет проигнорировано.
         """
         if self._closed:
-            raise RuntimeError("AggregatingLink is closed")
+            raise StreamClosed("AggregatingLink is closed")
         if not self._started:
             raise RuntimeError("AggregatingLink.start() must be called first")
         if not isinstance(payload, (bytes, bytearray, memoryview)):
@@ -581,6 +602,25 @@ class AggregatingLink:
 
         Нельзя вызывать одновременно дважды для одного stream_id, если
         image_reliability_mode — не NONE.
+
+        ВАЖНО — ограничение дедупликации при image_reliability_mode != NONE:
+        dedup входящих картинок сейчас идёт по stream_id (см. _dispatch_image),
+        а не по отдельному id сообщения. Это значит, что при STOP_AND_WAIT/
+        PARALLEL можно безопасно отправлять ТОЛЬКО ОДНО изображение за время
+        жизни данного stream_id: если на один и тот же stream_id вызвать
+        send_image() повторно (например, скриншот за скриншотом, как делает
+        AethernetStasisServer), то второй и все последующие вызовы будут
+        считаться дубликатами первого на стороне получателя, ACK на них уйдёт
+        не глядя на payload, а сам кадр до recv_image() не дойдёт —
+        отправитель решит, что доставлено, и получатель зависнет.
+
+        Если нужно слать поток разных изображений по одному stream_id
+        (текущий кейс с скриншотами) — используйте только
+        image_reliability_mode=ReliabilityMode.NONE. Для reliable-доставки
+        отдельных изображений либо шлите каждое на новом stream_id
+        (new_stream_id() перед каждым send_image()), либо потребуется
+        доработка dedup-механизма (разделение routing id и msg id) —
+        это НЕ реализовано.
         """
         if self._closed:
             raise RuntimeError("AggregatingLink is closed")
@@ -691,7 +731,10 @@ class AggregatingLink:
         stream_id = img_uuid.hex
         uuid_key = img_uuid.hex
 
-        is_duplicate = uuid_key in self._received_image_uuids_set
+        is_duplicate = (
+            self._image_reliability_mode != ReliabilityMode.NONE
+            and uuid_key in self._received_image_uuids_set
+        )
 
         if is_duplicate:
             self._logger.debug(
@@ -804,32 +847,40 @@ class AggregatingLink:
                     raw_packet = await asyncio.to_thread(
                         self._transport.recv, self._recv_restart_delay
                     )
+
+                    # ── изображение от medium_transport ──────────────────────────
+                    if isinstance(raw_packet, tuple):
+                        image, img_uuid = raw_packet
+                        self._logger.debug(
+                            f"recv image: uuid={img_uuid.hex[:8]}…, size={image.size}"
+                        )
+                        self._dispatch_image(img_uuid, image)
+                        self._cleanup_stale_chunk_assemblies()
+                        flushed = self._cleanup_stale_reorder_buffer()
+                        self._dispatch_flushed_payloads(flushed)
+                        if self._recv_restart_delay > 0:
+                            await asyncio.sleep(self._recv_restart_delay)
+                        continue
+
+                    # ── байтовый пакет ────────────────────────────────────────────
                     self._logger.debug(
                         f"recv physical packet: size={len(raw_packet)}, "
                         f"prefix={raw_packet[:32].hex()}"
                     )
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    self._logger.exception("Ошибка транспорта recv, продолжаем работу.")
-                    await asyncio.sleep(self._recv_restart_delay)
-                    continue
-
-                # ── изображение от medium_transport ──────────────────────────────
-                # Проверяется ДО ветвления по self._reliability_mode: формат
-                # входящего изображения не зависит от режима надёжности
-                # обычных data-фреймов, у него свой независимый
-                # self._image_reliability_mode.
-                if isinstance(raw_packet, tuple):
-                    image, img_uuid = raw_packet
-                    self._logger.debug(
-                        f"recv image: uuid={img_uuid.hex[:8]}…, size={image.size}"
+                except TransportClosedError:
+                    self._logger.warning(
+                        "Transport closed, stopping reader loop and closing link."
                     )
-                    self._dispatch_image(img_uuid, image)
-                    self._cleanup_stale_chunk_assemblies()
-                    self._cleanup_stale_reorder_buffer()
-                    if self._recv_restart_delay > 0:
-                        await asyncio.sleep(self._recv_restart_delay)
+                    asyncio.create_task(self.close())
+                    return
+                except Exception as e:
+                    self._logger.error(
+                        "Error while receiving a packet from medium_transport.recv, "
+                        f"retrying in {self._recv_restart_delay}: {e}."
+                    )
+                    await asyncio.sleep(self._recv_restart_delay)
                     continue
 
                 try:
@@ -850,22 +901,13 @@ class AggregatingLink:
                     self._process_incoming_acks(ack_seqs_received)
 
                 self._cleanup_stale_chunk_assemblies()
-                self._cleanup_stale_reorder_buffer()
+                flushed = self._cleanup_stale_reorder_buffer()
+                if flushed:
+                    # Флашнутые из-за TTL-разрыва payload'ы должны идти ПЕРЕД
+                    # только что декодированными — они логически раньше по seq.
+                    logical_payloads = flushed + logical_payloads
 
-                for logical_payload in logical_payloads:
-                    try:
-                        frames = self._decode_batch(logical_payload)
-                    except Exception as e:
-                        self._logger.error(f"Получен битый logical batch: {e}")
-                        continue
-
-                    self._logger.debug(
-                        f"Decoded logical batch: frames={len(frames)}, "
-                        f"payload_size={len(logical_payload)}"
-                    )
-
-                    for frame in frames:
-                        self._dispatch_frame(frame)
+                self._dispatch_flushed_payloads(logical_payloads)
 
                 if self._recv_restart_delay > 0:
                     await asyncio.sleep(self._recv_restart_delay)
@@ -873,6 +915,23 @@ class AggregatingLink:
         except asyncio.CancelledError:
             self._logger.debug("reader loop cancelled")
             raise
+
+    def _dispatch_flushed_payloads(self, logical_payloads: list[bytes]) -> None:
+        """Декодирует список logical batch и рассылает frame'ы по стримам."""
+        for logical_payload in logical_payloads:
+            try:
+                frames = self._decode_batch(logical_payload)
+            except Exception as e:
+                self._logger.error(f"Получен битый logical batch: {e}")
+                continue
+
+            self._logger.debug(
+                f"Decoded logical batch: frames={len(frames)}, "
+                f"payload_size={len(logical_payload)}"
+            )
+
+            for frame in frames:
+                self._dispatch_frame(frame)
 
     def _dispatch_frame(self, frame: Frame) -> None:
         """
@@ -1008,15 +1067,21 @@ class AggregatingLink:
             self._next_expected_seq += 1
         return result
 
-    def _cleanup_stale_reorder_buffer(self) -> None:
+    def _cleanup_stale_reorder_buffer(self) -> list[bytes]:
         """
         Удаляет записи из reorder buffer которые ждут слишком долго.
 
         На практике не должно срабатывать — ретрансмит бесконечный.
         Защита от крайнего случая когда соединение закрылось в середине.
+
+        Returns:
+            Список logical_payload, которые стало можно доставить сразу
+            после сдвига next_expected_seq (если после "дыры" в буфере уже
+            лежала непрерывная последовательность). Пустой список, если
+            ничего не изменилось.
         """
         if not self._reorder_buffer:
-            return
+            return []
 
         now = time.monotonic()
         stale = [
@@ -1024,11 +1089,15 @@ class AggregatingLink:
             for seq, (_, arrival) in self._reorder_buffer.items()
             if now - arrival > self._reorder_buffer_ttl
         ]
+        if not stale:
+            return []
+
         for seq in stale:
             self._logger.warning(f"Dropping stale reorder buffer entry: seq={seq}")
             del self._reorder_buffer[seq]
 
-        if stale and self._next_expected_seq in stale:
+        flushed: list[bytes] = []
+        if self._next_expected_seq in stale:
             if self._reorder_buffer:
                 self._next_expected_seq = min(self._reorder_buffer)
             else:
@@ -1040,6 +1109,14 @@ class AggregatingLink:
             )
             for queue in self._data_loss_subscribers:
                 queue.put_nowait(list(stale))
+
+            # После сдвига next_expected_seq в буфере может уже лежать
+            # непрерывный хвост (например buffer={5,6,7}, потеряли 3-4,
+            # next стал 5) — не ждём следующего физического пакета, а
+            # отдаём его сразу.
+            flushed = self._flush_reorder_buffer()
+
+        return flushed
 
     def _process_incoming_acks(self, ack_seqs: list[int]) -> None:
         """
@@ -1104,8 +1181,14 @@ class AggregatingLink:
                         await self._send_reliable(logical_payload)
                 except asyncio.CancelledError:
                     raise
+                except TransportClosedError:
+                    self._logger.warning(
+                        "Transport closed, stopping writer loop and closing link."
+                    )
+                    asyncio.create_task(self.close())
+                    return
                 except Exception:
-                    self._logger.exception("Ошибка при отправке сообщения")
+                    self._logger.exception("Error when sending a message via medium_transport.")
                     await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
@@ -1226,6 +1309,12 @@ class AggregatingLink:
 
                     try:
                         await self._send_physical_packet(pkt.packet_bytes)
+                    except TransportClosedError:
+                        self._logger.warning(
+                            "Transport closed, stopping retransmit loop and closing link."
+                        )
+                        asyncio.create_task(self.close())
+                        return
                     except Exception:
                         self._logger.exception(f"Retransmit failed for seq={pkt.seq}")
 
@@ -1269,6 +1358,14 @@ class AggregatingLink:
 
                 try:
                     await self._send_physical_packet(packet)
+                except asyncio.CancelledError:
+                    raise
+                except TransportClosedError:
+                    self._logger.warning(
+                        "Transport closed, stopping ack sender loop and closing link."
+                    )
+                    asyncio.create_task(self.close())
+                    return
                 except Exception:
                     self._logger.exception("Failed to send ACK-only packet")
                     for s in ack_seqs:
@@ -1453,4 +1550,5 @@ class AggregatingLink:
         try:
             await asyncio.Future()
         finally:
+            self._logger.info("Shutting down watcher")
             await self.close()

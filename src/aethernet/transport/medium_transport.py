@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 import os
 import logging
@@ -61,7 +62,7 @@ class MediumTransport:
         self._encryption_mode = encryption_mode
         self._key: bytes = encryption_key if encryption_key is not None else b""
 
-        self._basex = basex.init(alphabet=self.config.alphabet)
+        self._basex = basex.init(alphabet=self.config.alphabet) if self.config.alphabet else None
         self.max_message_chars = self.config.max_message_chars
 
         if self._mode == "string" and self.config.max_message_bytes is None:
@@ -111,8 +112,10 @@ class MediumTransport:
                 continue
             except TransportClosedError:
                 raise
-            except Exception:
-                self._logger.exception("Error receiving message from low_transport")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._logger.error(f"Error receiving message from low_transport: {e}")
                 time.sleep(recv_restart_delay)
 
         return self._decode(data)  # type: ignore[arg-type]
@@ -190,15 +193,15 @@ class MediumTransport:
                 "max_message_chars must be set when max_message_bytes is None"
             )
 
-        C = self.max_message_chars
+        c = self.max_message_chars
 
         low = 0
-        high = C  # rough upper bound (definitely not larger)
+        high = c # rough upper bound (definitely not larger)
 
         while low < high:
             mid = (low + high + 1) // 2
 
-            if self._encode_for_size(mid) <= C:
+            if self._encode_for_size(mid) <= c:
                 low = mid
             else:
                 high = mid - 1

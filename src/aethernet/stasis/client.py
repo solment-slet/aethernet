@@ -4,6 +4,7 @@ from typing import Any
 
 from PIL import Image
 
+from aethernet.exceptions import StreamClosed
 from aethernet.stasis.server import PROTOCOL_NAME
 from aethernet.stasis.dataclasses import StreamMode, StreamModes, ServerMetadata, RemoteHostMetadata
 from aethernet.stasis.exceptions import (
@@ -58,6 +59,7 @@ class AethernetStasisClient:
                 pass
 
     async def connect(self) -> ServerMetadata:
+        self._logger.info("Connecting...")
         stream_id = self._link.new_stream_id()
 
         await self._link.send_frame(
@@ -109,9 +111,14 @@ class AethernetStasisClient:
 
         return self.server_metadata
 
-    async def wait_screen(self) -> Image.Image:
+    async def get_screen(self) -> Image.Image:
         """Returns the latest screen image without returning the old ones, even if they were not received."""
+        self._logger.debug("Receiving a screen image.")
         return await self._link.recv_image(self.screen_stream_id)
+
+    async def get_error(self) -> Exception:
+        """Returns errors received from the server via callbacks_stream_id."""
+        return await self._errors_queue.get()
 
     async def set_stream_mode(self, mode: StreamModes, interval_ms: int | None = None) -> None:
         self._check_connect()
@@ -137,13 +144,18 @@ class AethernetStasisClient:
             try:
                 callback_frame = await self._link.recv_frame(self.callbacks_stream_id)
                 if callback_frame.frame_type == "error":
+                    err = AethernetStasisClient._handle_error(decode_json_bytes(callback_frame.payload))
                     AethernetStasisClient.put_latest(
                         self._errors_queue,
-                        AethernetStasisClient._handle_error(decode_json_bytes(callback_frame.payload)),
+                        err,
                     )
+                    self._logger.info(f"Error message was received in the Callback Loop: {err}")
                     continue
                 AethernetStasisClient.put_latest(self._callbacks_queue, callback_frame)
+                self._logger.info("Non‑error message was received in the Callback Loop.")
             except asyncio.CancelledError:
+                return
+            except StreamClosed:
                 return
             except Exception as e:
                 message = (

@@ -1,6 +1,6 @@
 class TransportClosedError(RuntimeError):
-    """Исключение возникающее при попытке обратиться"""
+    """An exception that occurs when attempting to access the transport when it is already closed."""
 
 
 class StreamClosed(Exception):
-    """Исключение, возникающее при закрытии link во время ожидания frame."""
+    """An exception that occurs when closing a link while waiting for a frame."""

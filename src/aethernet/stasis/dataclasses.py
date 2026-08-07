@@ -2,7 +2,7 @@ from typing import Literal
 from dataclasses import dataclass
 
 
-type StreamModes = Literal["on_request", "interval"]
+StreamModes = Literal["on_request", "interval"]
 
 @dataclass
 class StreamMode:
