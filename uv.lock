@@ -8,6 +8,7 @@ version = "2.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "basex-python" },
+    { name = "copykitten" },
     { name = "httpx" },
     { name = "msgpack" },
     { name = "pillow" },
@@ -53,6 +54,7 @@ requires-dist = [
     { name = "basex-python", specifier = "==0.1.0" },
     { name = "black", marker = "extra == 'lint'", specifier = ">=26.3,<27" },
     { name = "build", marker = "extra == 'build'", specifier = ">=1.4.3,<2" },
+    { name = "copykitten", specifier = ">=2.0.0,<3" },
     { name = "httpx", specifier = ">=0.28.1,<0.29" },
     { name = "hypothesis", marker = "extra == 'tests'", specifier = ">=6.152,<7" },
     { name = "msgpack", specifier = ">=1.2.1,<2" },
@@ -231,6 +233,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-time = "2022-10-25T02:36:22.414Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
+name = "copykitten"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c1/72/57a5dee794b29c940f6bc429ff731c3d0b9f7af0aad94bd88bafbc3db07f/copykitten-2.0.0.tar.gz", hash = "sha256:bda13d614ffb38147d4fce5217d4f2397967514f5ea09fb8d5c5cf5d16028e58", size = 19712, upload-time = "2025-09-21T02:48:24.848Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/24/2ff5084b1fe4825d47246de8f81fa738245ca6d6645b31dfc686bcbed51e/copykitten-2.0.0-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:191c202d19962fa5dbed5296d83bfa844b36609e30f0fb19cf1706b136f170e8", size = 381118, upload-time = "2025-09-21T02:48:17.65Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/aa/51d0d24435846eb8c41a5f68874a2a39d367e22c58eb3a955455b1e0c7bf/copykitten-2.0.0-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:1fb3118f5b3d9bc70442ae62f5d0b5fdd22243f2b4f2811e0680cbb4dfca112a", size = 359839, upload-time = "2025-09-21T02:48:19.422Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/3c/ba4ce92ffe21c695d1492fe495032eb2356a5ade4a497d238f7efd277cea/copykitten-2.0.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:6be53c8c45bb85bda1679ea2d890e24303096d2a9d9a1022e159b7cfd350b2c0", size = 453897, upload-time = "2025-09-21T02:48:21.055Z" },
+    { url = "https://files.pythonhosted.org/packages/98/59/5800f845f87f5841f467082698ccbe40e7eb000b1e069bdf24134c91c14c/copykitten-2.0.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:65b799e46da487e3380248065e5684d39e9f8f0f53b1124edba5e4fd2dc5a273", size = 502975, upload-time = "2025-09-21T02:48:22.428Z" },
+    { url = "https://files.pythonhosted.org/packages/60/45/22e1d8ffecadcfb0f57ba5189b6c2a7850621ad2045cbdf23a4d7f1f1849/copykitten-2.0.0-cp38-abi3-win_amd64.whl", hash = "sha256:00d09e79fe8031dbdfaefd843d60e48f2b63e6ea9a823d25e07a17469f25017e", size = 267324, upload-time = "2025-09-21T02:48:23.512Z" },
 ]
 
 [[package]]

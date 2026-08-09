@@ -38,3 +38,7 @@ class InvalidSessionError(RemoteDeviceError):
 
 class InternalError(RemoteDeviceError):
     """The remote device encountered an internal error."""
+
+
+class ExecutionError(RemoteDeviceError):
+    """Error performing actions on the remote device."""

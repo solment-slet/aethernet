@@ -6,7 +6,7 @@ authors = [
     { name = "Walter Kerrigan", email = "esolment@gmail.com" },
 ]
 readme = "README.md"
-requires-python = ">=3.12,<3.14"
+requires-python = ">=3.12"
 license = { file = "LICENSE" }
 dependencies = [
     "basex-python==0.1.0",
@@ -17,6 +17,7 @@ dependencies = [
     "pillow>=12.3,<13",
     "screeninfo>=0.8.1,<1",
     "pynput>=1.8.2,<2",
+    "copykitten>=2.0.0,<3"
 ]
 
 [project.optional-dependencies]

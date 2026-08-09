@@ -14,6 +14,8 @@ class ScreenManager:
         self.monitor = next((m for m in monitors if m.is_primary), monitors[0] if monitors else None)
         self.width =  self.monitor.width
         self.height =  self.monitor.height
+        self.x = self.monitor.x
+        self.y = self.monitor.y
         x1 = self.monitor.x
         y1 = self.monitor.y
         x2 = x1 + self.width

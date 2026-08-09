@@ -35,8 +35,8 @@ async def handle_client(low_transport: TCPLowTransport) -> None:
 
 
 async def main() -> None:
-    server_sock = await asyncio.to_thread(TCPLowTransport.listen, "0.0.0.0", 8765)
-    logger.info("Listening on 0.0.0.0:8765")
+    server_sock = await asyncio.to_thread(TCPLowTransport.listen, "0.0.0.0", 9876)
+    logger.info("Listening on 0.0.0.0:9876")
 
     try:
         low_transport = await asyncio.to_thread(TCPLowTransport.accept, server_sock)
