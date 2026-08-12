@@ -1,5 +1,5 @@
-from enum import StrEnum
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 
 class Key(StrEnum):
@@ -88,6 +88,7 @@ class Action:
 
 # --- Mouse ---
 
+
 @dataclass
 class MoveMouse(Action):
     x: int
@@ -123,6 +124,7 @@ class Scroll(Action):
 
 # --- Keyboard ---
 
+
 @dataclass
 class TypeText(Action):
     text: str
@@ -143,6 +145,7 @@ class ReleaseKey(Action):
 
 # --- Clipboard ---
 
+
 @dataclass
 class SetClipboard(Action):
     text: str
@@ -155,6 +158,7 @@ class GetClipboard(Action):
 
 
 # --- Delay ---
+
 
 @dataclass
 class Delay(Action):

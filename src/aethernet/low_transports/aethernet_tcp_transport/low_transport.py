@@ -6,21 +6,73 @@ import socket
 import threading
 import time
 import uuid
-from typing import Callable
+from collections.abc import Callable
+from functools import partial
 
 from PIL import Image
 
 from aethernet.exceptions import TransportClosedError
-from aethernet.transport.low_transport import LowTransport, LowTransportConfig, BytesAndImages
+from aethernet.transport.low_transport import (
+    BytesAndImages,
+    LowTransport,
+    LowTransportConfig,
+)
 
-_HEADER_KIND_SIZE = 1      # 0 = bytes, 1 = image
-_HEADER_LEN_SIZE = 4       # длина payload, big-endian, unsigned
-_STREAM_ID_SIZE = 16       # uuid.UUID.bytes
+_HEADER_KIND_SIZE = 1  # 0 = bytes, 1 = image
+_HEADER_LEN_SIZE = 4  # длина payload, big-endian, unsigned
+_STREAM_ID_SIZE = 16  # uuid.UUID.bytes
 _KIND_BYTES = 0
 _KIND_IMAGE = 1
 
 _DEFAULT_IMAGE_FORMAT = "JPEG"
 _RECV_CHUNK = 64 * 1024
+
+# TCP keepalive defaults: with these, a peer that vanishes without a clean
+# FIN/RST (network partition, crashed process, dropped wifi/NAT mapping)
+# gets detected by the OS - and a blocking recv() stuck on that dead
+# connection gets woken up with an error - within roughly
+# idle + interval * count seconds (~11s with these defaults), instead of
+# hanging forever. Without this, TCP has no idle timeout by default.
+_KEEPALIVE_IDLE_SECONDS = 5
+_KEEPALIVE_INTERVAL_SECONDS = 2
+_KEEPALIVE_PROBE_COUNT = 3
+
+
+def _enable_tcp_keepalive(
+    sock: socket.socket,
+    *,
+    idle: int = _KEEPALIVE_IDLE_SECONDS,
+    interval: int = _KEEPALIVE_INTERVAL_SECONDS,
+    count: int = _KEEPALIVE_PROBE_COUNT,
+) -> None:
+    """Enables OS-level TCP keepalive with aggressive-ish intervals.
+
+    Without this, a half-open connection (the peer disappeared but no
+    FIN/RST ever reached us) can leave a blocking recv() call stuck
+    forever - TCP itself has no idle timeout unless keepalive is enabled.
+    This is what makes shutdown/close() eventually able to interrupt a
+    stuck reader thread even when the peer is truly gone rather than just
+    quiet: once the OS gives up on the peer, the blocked recv() returns
+    with an error on its own, which the existing exception handling in
+    _readexactly already turns into _ConnectionLost / TransportClosedError.
+
+    Platform coverage:
+      - Linux: TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT, fully configurable.
+      - macOS: TCP_KEEPALIVE (idle time only; interval/count aren't exposed
+        via the stdlib socket module).
+      - Windows: SO_KEEPALIVE alone uses system-wide defaults (often
+        several minutes) - the stdlib socket module doesn't expose
+        per-socket idle/interval/count knobs here. If tighter detection is
+        needed on Windows, use socket.ioctl(SIO_KEEPALIVE_VALS, ...)
+        separately; not done here to keep this helper cross-platform.
+    """
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):  # Linux
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, count)
+    elif hasattr(socket, "TCP_KEEPALIVE"):  # macOS
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, idle)
 
 
 def _build_bytes_frame(data: bytes) -> bytes:
@@ -77,6 +129,12 @@ class TCPLowTransport(LowTransport[BytesAndImages]):
     Режим BytesAndImages: произвольные bytes-сообщения и кадры экрана
     (Image + uuid потока) мультиплексируются в одном соединении через
     фрейминг [kind:1][stream_id:16 если kind=image][len:4][payload].
+
+    TCP keepalive включён на сокете по умолчанию (см. _enable_tcp_keepalive):
+    без него полуразорванное соединение (пир исчез без FIN/RST) может
+    держать блокирующий recv() зависшим бесконечно — ни один вызов close()
+    или отмена asyncio-задачи это не прервут, пока ОС сама не признает
+    соединение мёртвым.
     """
 
     CONFIG = LowTransportConfig(
@@ -95,10 +153,19 @@ class TCPLowTransport(LowTransport[BytesAndImages]):
         *,
         image_format: str = _DEFAULT_IMAGE_FORMAT,
         image_quality: int = 80,
+        keepalive_idle: int = _KEEPALIVE_IDLE_SECONDS,
+        keepalive_interval: int = _KEEPALIVE_INTERVAL_SECONDS,
+        keepalive_count: int = _KEEPALIVE_PROBE_COUNT,
     ) -> None:
         super().__init__(config)
         self._sock = sock
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _enable_tcp_keepalive(
+            self._sock,
+            idle=keepalive_idle,
+            interval=keepalive_interval,
+            count=keepalive_count,
+        )
         self._image_format = image_format
         self._image_quality = image_quality
 
@@ -111,7 +178,9 @@ class TCPLowTransport(LowTransport[BytesAndImages]):
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def connect(cls, host: str, port: int, timeout: float | None = None, **kwargs) -> "TCPLowTransport":
+    def connect(
+        cls, host: str, port: int, timeout: float | None = None, **kwargs
+    ) -> TCPLowTransport:
         sock = socket.create_connection((host, port), timeout=timeout)
         return cls(sock, **kwargs)
 
@@ -125,7 +194,7 @@ class TCPLowTransport(LowTransport[BytesAndImages]):
         return server_sock
 
     @classmethod
-    def accept(cls, server_sock: socket.socket, **kwargs) -> "TCPLowTransport":
+    def accept(cls, server_sock: socket.socket, **kwargs) -> TCPLowTransport:
         conn, _addr = server_sock.accept()
         return cls(conn, **kwargs)
 
@@ -140,7 +209,9 @@ class TCPLowTransport(LowTransport[BytesAndImages]):
         if isinstance(data, tuple):
             image, stream_id = data
             if not self.config.supports_images:
-                raise ValueError("This transport instance is not configured with supports_images=True.")
+                raise ValueError(
+                    "This transport instance is not configured with supports_images=True."
+                )
             self._send_image(image, stream_id)
         else:
             if len(data) > self.config.max_message_bytes:
@@ -168,7 +239,9 @@ class TCPLowTransport(LowTransport[BytesAndImages]):
         self._last_send_ts = time.monotonic()
 
     def _send_image(self, image: Image.Image, stream_id: uuid.UUID) -> None:
-        frame = _build_image_frame(image, stream_id, self._image_format, self._image_quality)
+        frame = _build_image_frame(
+            image, stream_id, self._image_format, self._image_quality
+        )
         self._throttle(self.config.min_send_interval, is_send=True)
         self._sendall(frame)
         self._last_send_ts = time.monotonic()
@@ -228,6 +301,12 @@ class TCPLowTransportServer(LowTransport[BytesAndImages]):
     переподключения клиента: не нужно вручную оборачивать accept() в цикл
     снаружи и пересоздавать весь стек при каждом обрыве связи.
 
+    TCP keepalive включён на каждом принятом соединении (см.
+    _enable_tcp_keepalive): без него "тихая" смерть клиента (сеть
+    оборвалась, процесс убит без FIN/RST) оставляет блокирующий recv()
+    зависшим бесконечно, и ни close(), ни отмена asyncio-задачи это не
+    прерывают — только сама ОС, дождавшись неответа на keepalive-пробы.
+
     Пример использования (было — TCPLowTransport.listen/accept в ручном
     цикле снаружи, из-за чего разрыв клиента ронял весь transport и
     AggregatingLink; стало):
@@ -255,6 +334,10 @@ class TCPLowTransportServer(LowTransport[BytesAndImages]):
         logger: logging.Logger | None = None,
         on_client_connected: Callable[[tuple], None] | None = None,
         on_client_disconnected: Callable[[str], None] | None = None,
+        keepalive_idle: int = _KEEPALIVE_IDLE_SECONDS,
+        keepalive_interval: int = _KEEPALIVE_INTERVAL_SECONDS,
+        keepalive_count: int = _KEEPALIVE_PROBE_COUNT,
+        accept_poll_interval: float = 0.5,
     ) -> None:
         super().__init__(config)
         self._host = host
@@ -264,11 +347,15 @@ class TCPLowTransportServer(LowTransport[BytesAndImages]):
         self._logger = logger or logging.getLogger(__name__)
         self._on_client_connected = on_client_connected
         self._on_client_disconnected = on_client_disconnected
+        self._keepalive_idle = keepalive_idle
+        self._keepalive_interval = keepalive_interval
+        self._keepalive_count = keepalive_count
 
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.bind((host, port))
         self._server_sock.listen(backlog)
+        self._server_sock.settimeout(accept_poll_interval)
 
         # Текущее клиентское соединение (или None, если никто не подключён).
         self._conn: socket.socket | None = None
@@ -289,12 +376,6 @@ class TCPLowTransportServer(LowTransport[BytesAndImages]):
     # ------------------------------------------------------------------ #
 
     def _ensure_connection(self) -> socket.socket:
-        """
-        Возвращает текущее активное соединение. Если его нет — блокируется
-        на accept() до подключения нового клиента. Может вызываться
-        одновременно из потока чтения и потока записи: только один из них
-        реально примет соединение, второй увидит уже готовый self._conn.
-        """
         with self._conn_lock:
             if self._conn is not None:
                 return self._conn
@@ -302,14 +383,29 @@ class TCPLowTransportServer(LowTransport[BytesAndImages]):
                 raise TransportClosedError("TCPLowTransportServer is closed.")
 
             self._logger.info(f"Waiting for a client on {self._host}:{self._port}...")
-            try:
-                conn, addr = self._server_sock.accept()
-            except OSError as e:
+
+            while True:
                 if self._closed:
-                    raise TransportClosedError("TCPLowTransportServer is closed.") from e
-                raise
+                    raise TransportClosedError("TCPLowTransportServer is closed.")
+                try:
+                    conn, addr = self._server_sock.accept()
+                    break
+                except TimeoutError:
+                    continue
+                except OSError as e:
+                    if self._closed:
+                        raise TransportClosedError(
+                            "TCPLowTransportServer is closed."
+                        ) from e
+                    raise
 
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            _enable_tcp_keepalive(
+                conn,
+                idle=self._keepalive_idle,
+                interval=self._keepalive_interval,
+                count=self._keepalive_count,
+            )
             self._conn = conn
             self._logger.info(f"Client connected from {addr}")
             if self._on_client_connected is not None:
@@ -353,8 +449,12 @@ class TCPLowTransportServer(LowTransport[BytesAndImages]):
         if isinstance(data, tuple):
             image, stream_id = data
             if not self.config.supports_images:
-                raise ValueError("This transport instance is not configured with supports_images=True.")
-            frame = _build_image_frame(image, stream_id, self._image_format, self._image_quality)
+                raise ValueError(
+                    "This transport instance is not configured with supports_images=True."
+                )
+            frame = _build_image_frame(
+                image, stream_id, self._image_format, self._image_quality
+            )
         else:
             if len(data) > self.config.max_message_bytes:
                 raise ValueError(
@@ -387,11 +487,11 @@ class TCPLowTransportServer(LowTransport[BytesAndImages]):
             self._throttle(self.config.min_recv_interval, is_send=False)
 
             try:
-                result = _read_frame(lambda n: self._readexactly(sock, n))
+                result = _read_frame(partial(self._readexactly, sock))
             except _ConnectionLost as e:
                 self._drop_connection(sock, str(e))
                 continue  # ждём нового клиента и читаем следующий фрейм с начала
-            except ValueError:
+            except (ValueError, TypeError):
                 # Битый/неизвестный фрейм — соединение больше не доверенное,
                 # но сам transport остаётся живым для следующего клиента.
                 self._drop_connection(sock, "protocol error: unknown frame kind")
@@ -429,15 +529,16 @@ class TCPLowTransportServer(LowTransport[BytesAndImages]):
     # ------------------------------------------------------------------ #
 
     def close(self) -> None:
-        """Закрывает ВЕСЬ сервер: слушающий сокет и текущее соединение,
-        если оно есть. После этого send()/recv() всегда бросают
-        TransportClosedError — переподключиться уже нельзя, транспорт
-        предназначен для одноразового close()."""
-        with self._conn_lock:
-            if self._closed:
-                return
-            self._closed = True
+        if self._closed:
+            return
+        self._closed = True
 
+        try:
+            self._server_sock.close()
+        except OSError:
+            pass
+
+        with self._conn_lock:
             if self._conn is not None:
                 try:
                     self._conn.shutdown(socket.SHUT_RDWR)
@@ -448,11 +549,6 @@ class TCPLowTransportServer(LowTransport[BytesAndImages]):
                 except OSError:
                     pass
                 self._conn = None
-
-            try:
-                self._server_sock.close()
-            except OSError:
-                pass
 
         self._logger.info(f"TCPLowTransportServer on {self._host}:{self._port} closed")
 

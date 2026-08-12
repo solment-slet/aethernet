@@ -1,303 +1,257 @@
 from __future__ import annotations
 
 import asyncio
-import signal
-from typing import Any
 import logging
+import signal
+from collections.abc import Callable, Iterable
+from typing import Any, TypedDict
 
 import httpx
-import websockets
 
-from aethernet.transport.stack import get_link
+from aethernet.http.server import LinkHTTPProxyServer
+from aethernet.stasis.server import AethernetStasisServer
+from aethernet.transport import AggregatingLink, LowTransport
 from aethernet.transport.enums import EncryptionMode, ReliabilityMode
-from aethernet.transport import LowTransport, AggregatingLink
+from aethernet.transport.stack import get_link
 from aethernet.typing import LoggerLike
-from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
+from aethernet.ws.server import LinkWebSocketProxyServer
+
+
+class RouterKwargs(TypedDict):
+    http_client: httpx.AsyncClient | None
+    proxy_http_client: httpx.AsyncClient | None
+    sse_flush_bytes: int
+    sse_flush_interval: float
+    ws_recv_flush_interval: float
+    protocols: Iterable[str] | None
+    restart_backoff_seconds: float
+    max_consecutive_failures: int
+    healthy_run_seconds: float
+    logger: LoggerLike | None
 
 
 class ServerRouter:
+    """
+    Больше не роутит фреймы вручную по kind первого meta-фрейма — это делает
+    сам link через accept_stream(protocol). Задача ServerRouter теперь —
+    поднять и держать живыми слушателей всех протоколов поверх одного link.
+
+    Устойчивость: каждый протокольный сервер запускается под собственным
+    supervisor-тасом. Если внутренний dispatcher_task сервера падает с
+    исключением (а не штатно отменяется при close()), supervisor логирует
+    ошибку, выжидает backoff и поднимает сервер заново — падение одного
+    протокола не останавливает остальные и не требует рестарта процесса.
+    """
+
+    _RESTART_BACKOFF_SECONDS = 3.0
+    _MAX_CONSECUTIVE_FAILURES = 5
+    _HEALTHY_RUN_SECONDS = 30.0
+
     def __init__(
         self,
         link: AggregatingLink,
         *,
+        # HTTP
         http_client: httpx.AsyncClient | None = None,
         proxy_http_client: httpx.AsyncClient | None = None,
         sse_flush_bytes: int = 32 * 1024,
         sse_flush_interval: float = 0.5,
-        logger: LoggerLike = logging.getLogger(__name__),
+        # WS
+        ws_recv_flush_interval: float = 0.2,
+        # Какие протоколы поднимать. None = все (http, ws, stasis).
+        protocols: Iterable[str] | None = None,
+        # Устойчивость на уровне отдельного протокола
+        restart_backoff_seconds: float = _RESTART_BACKOFF_SECONDS,
+        # Если протокол падает подряд max_consecutive_failures раз, не
+        # прожив на этот раз хотя бы healthy_run_seconds, это уже похоже не
+        # на разовый сбой, а на то, что сломан сам link — тогда router
+        # перестаёт бесконечно ретраить этот протокол и вместо этого
+        # выставляет fatal_event, сигнализируя вызывающему коду, что нужно
+        # пересоздавать link целиком (см. AethernetServer / cli.py).
+        max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
+        healthy_run_seconds: float = _HEALTHY_RUN_SECONDS,
+        # Logging
+        logger: LoggerLike | None = None,
     ) -> None:
         self._link = link
-        self._http_client = http_client or httpx.AsyncClient(timeout=None)
-        self._proxy_http_client = proxy_http_client or httpx.AsyncClient(timeout=None)
-        self._sse_flush_bytes = sse_flush_bytes
-        self._sse_flush_interval = sse_flush_interval
-        self._logger = logger
-        self._task: asyncio.Task[None] | None = None
+        self._logger = logger if logger is not None else logging.getLogger(__name__)
         self._closed = False
+        self._restart_backoff_seconds = restart_backoff_seconds
+        self._max_consecutive_failures = max_consecutive_failures
+        self._healthy_run_seconds = healthy_run_seconds
 
-    async def start(self) -> None:
-        self._task = asyncio.create_task(self._loop(), name="MachineBRouter")
+        # Взводится, если один из протоколов падает слишком много раз
+        # подряд слишком быстро — сигнал наружу, что похоже сломан весь
+        # link, а не отдельный протокол, и нужно пересоздавать всё целиком.
+        self.fatal_event = asyncio.Event()
+        self._fatal_reason: str | None = None
 
-    async def close(self) -> None:
-        self._closed = True
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        await self._http_client.aclose()
-
-    async def _loop(self) -> None:
-        while not self._closed:
-            stream_id = await self._link.accept_stream()
-            asyncio.create_task(
-                self._handle_stream(stream_id), name=f"MachineBRouter.{stream_id}"
-            )
-
-    async def _handle_stream(self, stream_id: str) -> None:
-        print(f"B: new stream {stream_id}")
-        try:
-            first = await self._link.recv_frame(stream_id)
-            print(f"B: got first frame stream={stream_id} type={first.frame_type}")
-
-            if first.frame_type != "meta":
-                await self._send_error(
-                    stream_id, "Protocol error: first frame must be meta"
-                )
-                return
-
-            meta = decode_json_bytes(first.payload)
-            kind = meta.get("kind")
-            print(f"B: first meta kind={kind} stream={stream_id}")
-
-            if kind == "request_start":
-                await self._handle_http(stream_id, meta)
-                return
-
-            if kind == "ws_open":
-                await self._handle_ws(stream_id, meta)
-                return
-
-            await self._send_error(stream_id, f"Unknown initial kind: {kind!r}")
-
-        except Exception as e:
-            print(f"B: exception in _handle_stream stream={stream_id}: {e!r}")
-            await self._send_error(stream_id, f"{type(e).__name__}: {e}")
-
-    async def _handle_http(self, stream_id: str, first_meta: dict[str, Any]) -> None:
-        print("Выполняется _handle_http")
-        method = first_meta["method"]
-        url = first_meta["url"]
-        headers: list[tuple[str, str]] = [
-            (str(k), str(v)) for k, v in first_meta.get("headers", [])
-        ]
-
-        use_proxy = False
-        new_headers = []
-
-        for k, v in headers:
-            if k.lower() == "slet-aethernet-use-proxy":
-                use_proxy = True
-                continue
-            new_headers.append((k, v))
-
-        headers = new_headers
-        http_proxy = self._proxy_http_client if use_proxy else self._http_client
-
-        body_parts: list[bytes] = []
-
-        while True:
-            frame = await self._link.recv_frame(stream_id)
-
-            if frame.frame_type == "body":
-                body_parts.append(frame.payload)
-                if frame.end:
-                    break
-                continue
-
-            if frame.frame_type != "meta":
-                continue
-
-            meta = decode_json_bytes(frame.payload)
-            if meta.get("kind") == "request_end":
-                break
-            if frame.end:
-                break
-
-        body = b"".join(body_parts)
-
-        req = http_proxy.build_request(
-            method=method,
-            url=url,
-            headers=headers,
-            content=body,
-        )
-
-        print("Готовимся к отправке сообщения")
-        resp = await http_proxy.send(req, stream=True)
-        print("Получили ответ!")
-
-        content_type = resp.headers.get("content-type", "")
-        is_streaming = "text/event-stream" in content_type.lower()
-
-        await self._link.send_frame(
-            stream_id,
-            "meta",
-            encode_json_bytes(
-                {
-                    "kind": "response_start",
-                    "status_code": resp.status_code,
-                    "headers": list(resp.headers.multi_items()),
-                    "streaming": is_streaming,
-                }
+        # Каждая фабрика создаёт СВЕЖИЙ экземпляр протокольного сервера —
+        # используется при первом запуске и при рестарте после падения,
+        # чтобы не переиспользовать объект с потенциально испорченным
+        # внутренним состоянием (например, зависшими event'ами/буферами).
+        all_factories: dict[str, Callable[[], Any]] = {
+            "http": lambda: LinkHTTPProxyServer(
+                link,
+                upstream_client=http_client,
+                proxy_upstream_client=proxy_http_client,
+                sse_flush_bytes=sse_flush_bytes,
+                sse_flush_interval=sse_flush_interval,
             ),
-        )
-
-        try:
-            if is_streaming:
-                buffer = bytearray()
-                loop = asyncio.get_running_loop()
-                last_flush = loop.time()
-
-                async for chunk in resp.aiter_bytes():
-                    if chunk:
-                        buffer.extend(chunk)
-
-                    now = loop.time()
-                    if len(buffer) >= self._sse_flush_bytes or (
-                        buffer and now - last_flush >= self._sse_flush_interval
-                    ):
-                        await self._link.send_frame(stream_id, "body", bytes(buffer))
-                        buffer.clear()
-                        last_flush = now
-
-                if buffer:
-                    await self._link.send_frame(stream_id, "body", bytes(buffer))
-            else:
-                content = await resp.aread()
-                if content:
-                    await self._link.send_frame(stream_id, "body", content)
-
-            await self._link.send_frame(
-                stream_id,
-                "meta",
-                encode_json_bytes({"kind": "response_end"}),
-                end=True,
-            )
-        finally:
-            await resp.aclose()
-
-    async def _handle_ws(self, stream_id: str, first_meta: dict[str, Any]) -> None:
-        excluded = {"uri", "kind"}  # поля которые не идут в connect()
-        tuple_args = {"max_size", "max_queue", "write_limit"}
-
-        uri = first_meta["uri"]
-        ws_kwargs = {
-            k: v for k, v in first_meta.items() if k not in excluded and v is not None
+            "ws": lambda: LinkWebSocketProxyServer(
+                link,
+                recv_flush_interval=ws_recv_flush_interval,
+                logger=logger,
+            ),
+            "stasis": lambda: AethernetStasisServer(
+                link,
+                logger=logger,
+            ),
         }
 
-        for key in tuple_args:
-            if key in ws_kwargs and isinstance(ws_kwargs[key], list):
-                ws_kwargs[key] = tuple(ws_kwargs[key])
-
-        self._logger.info(f"B: WS open stream={stream_id} url={uri}")
-
-        try:
-            self._logger.debug(f"B: WS connecting upstream stream={stream_id}")
-            async with websockets.connect(uri, **ws_kwargs) as ws:
-                print(f"B: WS connected upstream stream={stream_id}")
-
-                await self._link.send_frame(
-                    stream_id,
-                    "meta",
-                    encode_json_bytes(
-                        {
-                            "kind": "ws_opened",
-                            "subprotocol": ws.subprotocol,
-                        }
-                    ),
+        if protocols is None:
+            selected = tuple(all_factories.keys())
+        else:
+            selected = tuple(protocols)
+            unknown = [p for p in selected if p not in all_factories]
+            if unknown:
+                raise ValueError(
+                    f"Unknown protocol(s) for ServerRouter: {', '.join(unknown)}. "
+                    f"Supported: {', '.join(all_factories.keys())}."
                 )
-                print(f"B: WS sent ws_opened stream={stream_id}")
+            if not selected:
+                raise ValueError("ServerRouter needs at least one protocol enabled.")
 
-                up = asyncio.create_task(self._ws_upstream_to_link(stream_id, ws))
-                down = asyncio.create_task(self._ws_link_to_upstream(stream_id, ws))
+        self._protocol_factories = {name: all_factories[name] for name in selected}
 
-                done, pending = await asyncio.wait(
-                    {up, down}, return_when=asyncio.FIRST_COMPLETED
-                )
+        # self.http / self.ws / self.stasis всегда указывают на ТЕКУЩИЙ живой
+        # экземпляр (или отсутствуют вовсе, если протокол не включён). После
+        # рестарта объект под этими именами меняется — не сохраняйте ссылку
+        # на server.http долгосрочно, обращайтесь через router.http заново.
+        for name, factory in self._protocol_factories.items():
+            setattr(self, name, factory())
 
-                for t in pending:
-                    t.cancel()
-                    try:
-                        await t
-                    except asyncio.CancelledError:
-                        pass
+        self._supervisor_tasks: list[asyncio.Task[None]] = []
 
-        except Exception as e:
-            print(f"B: WS exception stream={stream_id}: {e!r}")
-            await self._send_error(stream_id, f"{type(e).__name__}: {e}")
-
-    async def _ws_upstream_to_link(self, stream_id: str, ws) -> None:
-        try:
-            async for message in ws:
-                if isinstance(message, str):
-                    await self._link.send_frame(
-                        stream_id, "ws_text", message.encode("utf-8")
-                    )
-                else:
-                    await self._link.send_frame(stream_id, "ws_binary", bytes(message))
-
-            await self._link.send_frame(
-                stream_id,
-                "meta",
-                encode_json_bytes(
-                    {
-                        "kind": "ws_closed",
-                        "code": getattr(ws, "close_code", None),
-                        "reason": getattr(ws, "close_reason", "") or "",
-                    }
-                ),
-                end=True,
+    async def start(self) -> None:
+        for name in self._protocol_factories:
+            task = asyncio.create_task(
+                self._supervise(name),
+                name=f"ServerRouter.supervise.{name}",
             )
-        except Exception as e:
-            await self._send_error(stream_id, f"{type(e).__name__}: {e}")
+            self._supervisor_tasks.append(task)
 
-    async def _ws_link_to_upstream(self, stream_id: str, ws) -> None:
-        while True:
-            frame = await self._link.recv_frame(stream_id)
+    async def _supervise(self, name: str) -> None:
+        """
+        Создаёт свежий экземпляр протокольного сервера через фабрику,
+        запускает его и ждёт завершения его dispatcher_task. Если завершение
+        не было штатной отменой (сервер упал сам) — старый объект просто
+        выбрасывается, после паузы создаётся НОВЫЙ экземпляр с чистого листа
+        и подставляется в self.<name>. Останавливается только когда роутер
+        закрыт.
 
-            if frame.frame_type == "ws_text":
-                await ws.send(frame.payload.decode("utf-8"))
-                continue
+        Если протокол падает подряд max_consecutive_failures раз, ни разу не
+        продержавшись дольше healthy_run_seconds — это больше похоже на
+        сломанный link, чем на случайный сбой конкретного протокола. В этом
+        случае supervisor логирует critical, выставляет self.fatal_event и
+        останавливается сам (остальные протоколы продолжают ретраиться
+        независимо, пока вызывающий код не решит пересоздать весь router).
+        """
+        factory = self._protocol_factories[name]
+        loop = asyncio.get_running_loop()
+        consecutive_failures = 0
 
-            if frame.frame_type == "ws_binary":
-                await ws.send(frame.payload)
-                continue
+        while not self._closed:
+            server = factory()
+            setattr(self, name, server)
+            attempt_started_at = loop.time()
 
-            if frame.frame_type != "meta":
-                continue
+            try:
+                await server.start()
+            except Exception as e:
+                self._logger.error(f"{name}: failed to start: {e!r}")
+            else:
+                task = getattr(server, "_dispatcher_task", None)
+                if task is None:
+                    self._logger.error(
+                        f"{name}: no _dispatcher_task after start(), "
+                        "cannot supervise this server"
+                    )
+                    return
 
-            meta = decode_json_bytes(frame.payload)
-            kind = meta.get("kind")
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    # Штатная остановка через close() — supervisor тоже выходит.
+                    return
+                except Exception as e:
+                    self._logger.error(f"{name}: dispatcher died unexpectedly: {e!r}")
 
-            if kind == "ws_close":
-                await ws.close(
-                    code=int(meta.get("code", 1000)), reason=meta.get("reason", "")
+            if self._closed:
+                return
+
+            # Подчищаем упавший объект, чтобы он не держал ресурсы висящими.
+            try:
+                await server.close()
+            except Exception as e:
+                self._logger.error(
+                    f"{name}: error while cleaning up failed instance: {e!r}"
                 )
+
+            ran_for = loop.time() - attempt_started_at
+            if ran_for >= self._healthy_run_seconds:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+
+            if consecutive_failures >= self._max_consecutive_failures:
+                self._logger.critical(
+                    f"{name}: {consecutive_failures} consecutive failures within "
+                    f"{self._healthy_run_seconds}s each — assuming the link itself "
+                    "is broken, not just this protocol. Marking router as fatal."
+                )
+                self._fatal_reason = (
+                    f"{name} failed {consecutive_failures} times in a row "
+                    "without a healthy run"
+                )
+                self.fatal_event.set()
                 return
 
-            if kind == "error":
-                await ws.close(code=1011, reason="remote error")
-                return
+            self._logger.warning(
+                f"{name}: restarting with a fresh instance in "
+                f"{self._restart_backoff_seconds}s "
+                f"(consecutive failures: {consecutive_failures}/{self._max_consecutive_failures})"
+            )
+            await asyncio.sleep(self._restart_backoff_seconds)
 
-    async def _send_error(self, stream_id: str, message: str) -> None:
-        await self._link.send_frame(
-            stream_id,
-            "meta",
-            encode_json_bytes({"kind": "error", "message": message}),
-            end=True,
-        )
+    @property
+    def fatal_reason(self) -> str | None:
+        return self._fatal_reason
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        for name in self._protocol_factories:
+            server = getattr(self, name)
+            try:
+                await server.close()
+            except Exception as e:
+                self._logger.error(
+                    f"Error while closing {type(server).__name__}: {e!r}"
+                )
+
+        for task in self._supervisor_tasks:
+            task.cancel()
+        for task in self._supervisor_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._supervisor_tasks.clear()
+        self.fatal_event.clear()
+        self._fatal_reason = None
 
 
 class AethernetServer(ServerRouter):
@@ -305,28 +259,59 @@ class AethernetServer(ServerRouter):
         self,
         transport: AggregatingLink,
         *,
-        # Server Router
-        http_client: httpx.AsyncClient = httpx.AsyncClient(
-            timeout=None, trust_env=False
-        ),
-        proxy_http_client: httpx.AsyncClient = httpx.AsyncClient(timeout=None),
+        # Server Router / HTTP
+        http_client: httpx.AsyncClient | None = None,
+        proxy_http_client: httpx.AsyncClient | None = None,
         sse_flush_bytes: int = 65536,
         sse_flush_interval: float = 0.5,
+        # WS
+        ws_recv_flush_interval: float = 0.2,
+        # Какие протоколы поднимать
+        protocols: Iterable[str] | None = None,
+        # Устойчивость на уровне отдельного протокола
+        restart_backoff_seconds: float = ServerRouter._RESTART_BACKOFF_SECONDS,
+        max_consecutive_failures: int = ServerRouter._MAX_CONSECUTIVE_FAILURES,
+        healthy_run_seconds: float = ServerRouter._HEALTHY_RUN_SECONDS,
+        # Пауза перед пересозданием ВСЕГО транспорта, если fatal_event
+        # выставлен (link целиком считается сломанным).
+        transport_restart_backoff_seconds: float = ServerRouter._RESTART_BACKOFF_SECONDS,
         # Logging
-        logger: LoggerLike = logging.getLogger(),
+        logger: LoggerLike | None = None,
     ) -> None:
         self.stop_event = asyncio.Event()
-
         self.transport = transport
+        self._transport_restart_backoff_seconds = transport_restart_backoff_seconds
+        # Заполняется только внутри create(): async-фабрика, которая с нуля
+        # поднимает новый AggregatingLink с теми же параметрами, что и
+        # исходный. Если сервер создан напрямую (не через create()), она
+        # остаётся None, и восстановиться после гибели всего link мы не
+        # можем — только залогировать это и остановиться.
+        self._rebuild_transport: Any = None
 
-        super().__init__(
-            self.transport,
-            http_client=http_client,
-            proxy_http_client=proxy_http_client,
-            sse_flush_bytes=sse_flush_bytes,
-            sse_flush_interval=sse_flush_interval,
-            logger=logger,
-        )
+        # Параметры роутера запоминаем, чтобы иметь возможность заново
+        # проинициализировать ServerRouter на новом transport после
+        # пересоздания link (см. _reinit_router).
+        # noinspection PyTypeChecker
+        self._router_kwargs: RouterKwargs = {
+            "http_client": http_client
+            or httpx.AsyncClient(timeout=None, trust_env=False),
+            "proxy_http_client": proxy_http_client or httpx.AsyncClient(timeout=None),
+            "sse_flush_bytes": sse_flush_bytes,
+            "sse_flush_interval": sse_flush_interval,
+            "ws_recv_flush_interval": ws_recv_flush_interval,
+            "protocols": protocols,
+            "restart_backoff_seconds": restart_backoff_seconds,
+            "max_consecutive_failures": max_consecutive_failures,
+            "healthy_run_seconds": healthy_run_seconds,
+            "logger": logger if logger is not None else logging.getLogger(__name__),
+        }
+
+        super().__init__(transport, **self._router_kwargs)
+
+    def _reinit_router(self, transport: AggregatingLink) -> None:
+        """Заново поднимает состояние ServerRouter поверх нового transport."""
+        self.transport = transport
+        ServerRouter.__init__(self, transport, **self._router_kwargs)
 
     @classmethod
     async def create(
@@ -347,56 +332,133 @@ class AethernetServer(ServerRouter):
         ack_batch_size: int = 8,
         received_seqs_window: int = 256,
         reorder_buffer_ttl: float = 500.0,
-        # Server Router
-        http_client: httpx.AsyncClient = httpx.AsyncClient(
-            timeout=None, trust_env=False
-        ),
-        proxy_http_client: httpx.AsyncClient = httpx.AsyncClient(timeout=None),
-        # HTTP Aggregating
+        # Server Router / HTTP
+        http_client: httpx.AsyncClient | None = None,
+        proxy_http_client: httpx.AsyncClient | None = None,
         sse_flush_bytes: int = 65536,
         sse_flush_interval: float = 0.5,
+        # WS
+        ws_recv_flush_interval: float = 0.2,
+        # Какие протоколы поднимать
+        protocols: Iterable[str] | None = None,
+        # Устойчивость
+        transport_restart_backoff_seconds: float = ServerRouter._RESTART_BACKOFF_SECONDS,
         # Logging
-        logger: LoggerLike = logging.getLogger(),
+        logger: LoggerLike | None = None,
     ) -> AethernetServer:
-        transport = await get_link(
-            low_transport,
-            encryption_mode=encryption_mode,
-            encryption_key=encryption_key,
-            flush_interval=flush_interval,
-            max_batch_size=max_batch_size,
-            reliability_mode=reliability_mode,
-            window_size=window_size,
-            ack_flush_interval=ack_flush_interval,
-            ack_batch_size=ack_batch_size,
-            received_seqs_window=received_seqs_window,
-            chunk_assembly_ttl=chunk_assembly_ttl,
-            reorder_buffer_ttl=reorder_buffer_ttl,
-            logger=logger,
-        )
+        logger = logger if logger is not None else logging.getLogger(__name__)
 
-        return cls(
+        async def build_transport() -> AggregatingLink:
+            return await get_link(
+                low_transport,
+                encryption_mode=encryption_mode,
+                encryption_key=encryption_key,
+                flush_interval=flush_interval,
+                max_batch_size=max_batch_size,
+                reliability_mode=reliability_mode,
+                window_size=window_size,
+                ack_flush_interval=ack_flush_interval,
+                ack_batch_size=ack_batch_size,
+                received_seqs_window=received_seqs_window,
+                chunk_assembly_ttl=chunk_assembly_ttl,
+                reorder_buffer_ttl=reorder_buffer_ttl,
+                logger=logger,
+            )
+
+        transport = await build_transport()
+
+        server = cls(
             transport,
             http_client=http_client,
             proxy_http_client=proxy_http_client,
             sse_flush_bytes=sse_flush_bytes,
             sse_flush_interval=sse_flush_interval,
+            ws_recv_flush_interval=ws_recv_flush_interval,
+            protocols=protocols,
+            transport_restart_backoff_seconds=transport_restart_backoff_seconds,
             logger=logger,
         )
+        # low_transport, скорее всего, одноразовый (например, уже открытый
+        # сокет) — если он не переиспользуем, попытка автоматического
+        # пересоздания транспорта после фатального сбоя тоже, скорее всего,
+        # не сработает, но мы всё равно пробуем и логируем результат.
+        server._rebuild_transport = build_transport
+        return server
 
     async def start_and_wait(self) -> None:
-        """Запуск сервера и ожидание завершения программы"""
-        await self.start()
+        """
+        Запуск сервера и ожидание завершения программы.
 
+        Устойчиво к гибели ВСЕГО link/ServerRouter: если один из протоколов
+        падает подряд слишком много раз подряд без здорового периода работы,
+        ServerRouter взводит fatal_event (см. ServerRouter._supervise). Здесь
+        это ловится, весь router и старый transport закрываются, логируется
+        critical, и (если сервер создан через create()) transport и router
+        пересоздаются с нуля через build_transport(). Если пересоздать
+        transport невозможно (сервер создан напрямую с готовым transport),
+        сервер логирует это и завершает работу.
+        """
         event_loop = asyncio.get_event_loop()
-
         event_loop.add_signal_handler(signal.SIGTERM, self.stop_event.set)  # type: ignore[arg-type]
         event_loop.add_signal_handler(signal.SIGINT, self.stop_event.set)  # type: ignore[arg-type]
 
         try:
-            await self.stop_event.wait()
+            while not self.stop_event.is_set():
+                await self.start()
+
+                fatal_wait = asyncio.create_task(self.fatal_event.wait())
+                stop_wait = asyncio.create_task(self.stop_event.wait())
+                await asyncio.wait(
+                    {fatal_wait, stop_wait}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in (fatal_wait, stop_wait):
+                    if not t.done():
+                        t.cancel()
+
+                if self.stop_event.is_set():
+                    break
+
+                reason = self.fatal_reason
+                self._logger.critical(
+                    f"AethernetServer: link/router considered fatally broken "
+                    f"({reason}); tearing down and recreating from scratch."
+                )
+
+                await ServerRouter.close(self)
+                try:
+                    await self.transport.close()
+                except Exception as e:
+                    self._logger.error(f"Error closing broken transport: {e!r}")
+
+                if self._rebuild_transport is None:
+                    self._logger.critical(
+                        "AethernetServer was created with a pre-built transport "
+                        "(not via create()), so it cannot rebuild it automatically. "
+                        "Stopping."
+                    )
+                    break
+
+                self._logger.warning(
+                    f"Reconnecting in {self._transport_restart_backoff_seconds}s..."
+                )
+                await asyncio.sleep(self._transport_restart_backoff_seconds)
+
+                try:
+                    new_transport = await self._rebuild_transport()
+                except Exception as e:
+                    self._logger.error(
+                        f"Failed to rebuild transport: {e!r}. Will retry."
+                    )
+                    continue
+
+                self._logger.info("Transport rebuilt successfully, resuming.")
+                self._reinit_router(new_transport)
         finally:
             await self.close()
 
     async def close(self) -> None:
-        await super().close()
-        await self.transport.close()
+        await ServerRouter.close(self)
+        try:
+            await self.transport.close()
+        except Exception as e:
+            self._logger.error(f"Error closing transport: {e!r}")

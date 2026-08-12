@@ -1,5 +1,4 @@
 import json
-
 from unittest.mock import MagicMock
 
 # ===================================================================
@@ -21,10 +20,12 @@ def meta_frame(kind: str, **kwargs) -> MagicMock:
     return MagicMock(frame_type="meta", payload=payload)
 
 
-def make_frame(frame_type: str, payload: bytes) -> MagicMock:
+def make_frame(frame_type: str, payload: bytes, protocol: str | None = None) -> MagicMock:
     frame = MagicMock()
     frame.frame_type = frame_type
     frame.payload = payload
+    if protocol:
+        frame.protocol = protocol
     return frame
 
 

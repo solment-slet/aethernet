@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import httpx
 
-from aethernet.transport import AggregatingLink
-from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
-from aethernet.transport.http_over_link.common import (
+from aethernet.http.common import (
     PROTOCOL_NAME,
     ResponseStart,
     headers_to_list,
 )
+from aethernet.transport import AggregatingLink
+from aethernet.transport.utils import decode_json_bytes, encode_json_bytes
 
 
 class LinkResponseByteStream(httpx.AsyncByteStream):

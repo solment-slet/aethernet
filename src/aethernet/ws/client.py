@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Sequence, Mapping
+from typing import Any
 
+from websockets.datastructures import Headers
 from websockets.exceptions import (
     ConnectionClosed,
     ConnectionClosedError,
@@ -11,10 +13,9 @@ from websockets.exceptions import (
 )
 from websockets.frames import Close
 from websockets.http11 import Response
-from websockets.datastructures import Headers
 
 from aethernet.transport import AggregatingLink
-from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
+from aethernet.transport.utils import decode_json_bytes, encode_json_bytes
 
 HeadersLike = Any
 
@@ -224,25 +225,25 @@ class _WebSocketConnector:
     ) -> None:
         self._link = link
         self._uri = uri
-        self._params = dict(
-            origin=origin,
-            subprotocols=None if subprotocols is None else list(subprotocols),
-            compression=compression,
-            additional_headers=(
+        self._params = {
+            "origin": origin,
+            "subprotocols": None if subprotocols is None else list(subprotocols),
+            "compression": compression,
+            "additional_headers": (
                 None
                 if additional_headers is None
                 else _normalize_headers(additional_headers)
             ),
-            user_agent_header=user_agent_header,
-            proxy=proxy,
-            open_timeout=open_timeout,
-            ping_interval=ping_interval,
-            ping_timeout=ping_timeout,
-            close_timeout=close_timeout,
-            max_size=max_size,
-            max_queue=max_queue,
-            write_limit=write_limit,
-        )
+            "user_agent_header": user_agent_header,
+            "proxy": proxy,
+            "open_timeout": open_timeout,
+            "ping_interval": ping_interval,
+            "ping_timeout": ping_timeout,
+            "close_timeout": close_timeout,
+            "max_size": max_size,
+            "max_queue": max_queue,
+            "write_limit": write_limit,
+        }
         self._client: LinkWebSocketClient | None = None
 
     async def _open(self) -> LinkWebSocketClient:

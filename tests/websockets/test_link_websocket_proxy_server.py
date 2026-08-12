@@ -1,10 +1,10 @@
 import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
-from unittest.mock import MagicMock, patch, AsyncMock
-
-from aethernet.transport.ws_over_link.ws_over_link_server import (
+from aethernet.ws.server import (
     LinkWebSocketProxyServer,
 )
 from tests.helpers import make_frame, meta_payload
@@ -53,28 +53,28 @@ async def test_close_without_start_is_safe(mock_link):
 
 
 @pytest.mark.asyncio
-async def test_try_handle_stream_ignores_non_meta_frame(mock_link):
+async def test_handle_stream_ignores_non_meta_frame(mock_link):
     """Если первый фрейм не meta — stream игнорируется."""
     server = LinkWebSocketProxyServer(link=mock_link)
-    mock_link.recv_frame.return_value = make_frame("ws_text", b"hello")
+    mock_link.recv_frame.return_value = make_frame("ws_text", b"hello", "ws")
 
-    # Не должно упасть и не должно ничего отправить
-    await server._try_handle_stream("stream-1")
+    # Не должно упасть, должно отправить Protocol Error
+    await server._handle_stream("stream-1")
 
-    mock_link.send_frame.assert_not_awaited()
+    mock_link.send_frame.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_try_handle_stream_ignores_unknown_meta_kind(mock_link):
-    """Если kind != ws_open — stream тоже игнорируется."""
+async def test_handle_stream_ignores_unknown_meta_kind(mock_link):
+    """Если kind != ws_open — stream отправляет Protocol Error."""
     server = LinkWebSocketProxyServer(link=mock_link)
     mock_link.recv_frame.return_value = make_frame(
-        "meta", meta_payload({"kind": "http_request"})
+        "meta", meta_payload({"kind": "http_request"}), "ws",
     )
 
-    await server._try_handle_stream("stream-1")
+    await server._handle_stream("stream-1")
 
-    mock_link.send_frame.assert_not_awaited()
+    mock_link.send_frame.assert_awaited_once()
 
 
 # ======================================================================
@@ -87,10 +87,10 @@ async def test_handle_ws_stream_connect_error_sends_error_frame(mock_link):
     """Если websockets.connect() падает — клиенту уходит error-фрейм."""
     server = LinkWebSocketProxyServer(link=mock_link)
 
-    open_meta = {"url": "ws://bad-host", "headers": [], "subprotocols": []}
+    open_meta = {"uri": "ws://bad-host", "headers": [], "subprotocols": []}
 
     with patch(
-        "aethernet.transport.ws_over_link.ws_over_link_server.websockets.connect",
+        "aethernet.ws.server.websockets.connect",
         side_effect=OSError("connection refused"),
     ):
         await server._handle_ws_stream("stream-1", open_meta)
@@ -115,7 +115,7 @@ async def test_pump_upstream_text_and_binary(mock_link):
     """Текстовые и бинарные сообщения от upstream корректно пересылаются в link."""
     server = LinkWebSocketProxyServer(link=mock_link)
 
-    async def fake_aiter(self):
+    async def fake_aiter(self): # noqa
         yield "hello"
         yield b"\x01\x02"
 
@@ -144,9 +144,9 @@ async def test_pump_upstream_exception_sends_error(mock_link):
     """Если при чтении из upstream падает исключение — уходит error-фрейм."""
     server = LinkWebSocketProxyServer(link=mock_link)
 
-    async def bad_aiter(self):
+    async def bad_aiter(self): # noqa
         raise RuntimeError("upstream died")
-        if False:
+        if False: # noqa
             yield
 
     ws = MagicMock()

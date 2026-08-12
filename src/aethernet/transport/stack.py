@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from aethernet.transport import AggregatingLink, MediumTransport
 from aethernet.transport.enums import EncryptionMode, ReliabilityMode
 from aethernet.transport.low_transport import LowTransport
-from aethernet.transport import AggregatingLink, MediumTransport
 from aethernet.typing import LoggerLike
 
 

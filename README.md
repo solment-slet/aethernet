@@ -122,7 +122,7 @@ class MyTransport(LowTransport):
         # release resources (optional)
         pass
 
-    def send(self, data:  bytes) -> None:
+    def send(self, data: bytes) -> None:
         # deliver `data` through your channel
         raise NotImplementedError
 

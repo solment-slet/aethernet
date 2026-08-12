@@ -1,5 +1,6 @@
 # --- Local Device Errors ---
 
+
 class LocalDeviceError(Exception):
     """Base exception for the local device."""
 
@@ -14,9 +15,13 @@ class NotConnectedError(LocalDeviceError):
 
 # --- Remote Device Errors ---
 
+
 class RemoteDeviceError(LocalDeviceError):
     """Errors sent by the remote device."""
-    def __init__(self, *, reason: str | None = None, message: str | None = None) -> None:
+
+    def __init__(
+        self, *, reason: str | None = None, message: str | None = None
+    ) -> None:
         reason = "unknown_error" if reason is None else reason
         message = "Unknown Error" if message is None else message
 

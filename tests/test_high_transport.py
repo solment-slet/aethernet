@@ -34,6 +34,7 @@ import time
 
 import pytest
 
+from aethernet.exceptions import StreamClosed
 from aethernet.transport.enums import ReliabilityMode
 from aethernet.transport.high_transport import (
     AggregatingLink,
@@ -263,7 +264,6 @@ MODE_IDS = {
 
 
 class TestBasicDelivery:
-
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_single_frame(self, mode):
         async def body():
@@ -479,7 +479,6 @@ class TestReorderBuffer:
 
 
 class TestBatching:
-
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_all_frames_delivered(self, mode):
         async def body():
@@ -507,7 +506,6 @@ class TestBatching:
 
 
 class TestMultipleStreams:
-
     @pytest.mark.parametrize("mode", ALL_MODES, ids=[MODE_IDS[m] for m in ALL_MODES])
     def test_independent_streams(self, mode):
         async def body():
@@ -533,7 +531,7 @@ class TestMultipleStreams:
             async def work():
                 sid = AggregatingLink.new_stream_id()
                 await la.send_frame(sid, "hello", b"world")
-                discovered = await asyncio.wait_for(lb.accept_stream(), timeout=3.0)
+                discovered = await asyncio.wait_for(lb.accept_stream(protocol=""), timeout=3.0)
                 assert discovered == sid
 
             await start_and_close(la, lb, work())
@@ -547,7 +545,6 @@ class TestMultipleStreams:
 
 
 class TestRetransmission:
-
     @pytest.mark.parametrize("mode", ARQ_MODES, ids=[MODE_IDS[m] for m in ARQ_MODES])
     def test_delivery_30pct_loss(self, mode):
         async def body():
@@ -605,7 +602,6 @@ class TestRetransmission:
 
 
 class TestDeduplication:
-
     def test_duplicate_not_delivered_twice(self):
         """Дубликат физического пакета не порождает дубликат frame."""
 
@@ -685,7 +681,6 @@ class TestDeduplication:
 
 
 class TestAckPiggyback:
-
     def test_packet_count_reasonable_bidirectional(self):
         """При двунаправленной передаче общее число физических пакетов разумно."""
 
@@ -731,7 +726,6 @@ class TestAckPiggyback:
 
 
 class TestModeNone:
-
     def test_legacy_ags1_format(self):
         async def body():
             low_a, low_b = reliable_fast()
@@ -793,7 +787,6 @@ class TestModeNone:
 
 
 class TestChunking:
-
     def test_large_payload_delivered(self):
         async def body():
             low_a, low_b = reliable_fast()
@@ -819,7 +812,6 @@ class TestChunking:
 
 
 class TestLifecycle:
-
     def test_start_idempotent(self):
         async def body():
             la, lb = make_pair(*reliable_fast())
@@ -848,7 +840,7 @@ class TestLifecycle:
             await lb.start()
             await la.close()
             await lb.close()
-            with pytest.raises(RuntimeError, match="closed"):
+            with pytest.raises(StreamClosed):
                 await la.send_frame("sid", "t", b"x")
 
         run(body())
@@ -897,7 +889,6 @@ class TestLifecycle:
 
 
 class TestSlowTransport:
-
     @pytest.mark.parametrize("mode", ARQ_MODES, ids=[MODE_IDS[m] for m in ARQ_MODES])
     def test_delivery_slow_reliable(self, mode):
         async def body():
@@ -920,7 +911,6 @@ class TestSlowTransport:
 
 
 class TestStopAndWait:
-
     def test_window_size_forced_to_one(self):
         async def body():
             low_a, low_b = reliable_fast()
@@ -958,7 +948,6 @@ class TestStopAndWait:
 
 
 class TestParallel:
-
     def test_window_semaphore_initial_value(self):
         async def body():
             low_a, low_b = reliable_fast()
@@ -1016,7 +1005,6 @@ class TestParallel:
 
 
 class TestStreamId:
-
     def test_unique(self):
         ids = {AggregatingLink.new_stream_id() for _ in range(1000)}
         assert len(ids) == 1000
@@ -1033,7 +1021,6 @@ class TestStreamId:
 
 
 class TestPacketCodec:
-
     def test_roundtrip_with_acks(self):
         pkt = _build_packet(seq=42, ack_seqs=[1, 2, 3], payload=b"hello")
         seq, acks, payload = _parse_packet(pkt)
@@ -1082,8 +1069,7 @@ class TestPacketCodec:
 # ===========================================================================
 
 try:
-    from hypothesis import given, settings, HealthCheck
-    from hypothesis import strategies as st
+    from hypothesis import HealthCheck, given, settings, strategies as st
 
     _HYPOTHESIS = True
 except ImportError:
@@ -1092,7 +1078,6 @@ except ImportError:
 if _HYPOTHESIS:
 
     class TestHypothesis:
-
         @given(
             payload=st.binary(min_size=0, max_size=4096),
             frame_type=st.text(

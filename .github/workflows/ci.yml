@@ -20,11 +20,11 @@ jobs:
       - name: Install linting deps
         run: pip install -e ".[lint]"
 
-      - name: black
-        run: black --check .
-
-      - name: ruff
+      - name: ruff check
         run: ruff check .
+
+      - name: ruff format check
+        run: ruff format --check .
 
       - name: mypy
         run: mypy .

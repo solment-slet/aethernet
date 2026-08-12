@@ -1,9 +1,9 @@
-from aethernet.transport.ws_over_link.ws_over_link import (
-    LinkWebSocketClient,
+from aethernet.ws.client import (
     AethernetWebSockets,
+    LinkWebSocketClient,
 )
-from aethernet.transport.ws_over_link.ws_over_link_server import (
+from aethernet.ws.server import (
     LinkWebSocketProxyServer,
 )
 
-__all__ = ["LinkWebSocketClient", "AethernetWebSockets", "LinkWebSocketProxyServer"]
+__all__ = ["AethernetWebSockets", "LinkWebSocketClient", "LinkWebSocketProxyServer"]

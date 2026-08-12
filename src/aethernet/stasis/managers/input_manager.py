@@ -1,12 +1,19 @@
 import subprocess
 import sys
 
-from pynput.mouse import Controller as MouseController, Button
 from pynput.keyboard import Controller as KeyboardController, Key as PynputKey
+from pynput.mouse import Button, Controller as MouseController
 
 from aethernet.stasis.actions import (
-    MoveMouse, ClickButton, PressButton, ReleaseButton, Scroll,
-    TypeText, PressKey, ReleaseKey, Key,
+    ClickButton,
+    Key,
+    MoveMouse,
+    PressButton,
+    PressKey,
+    ReleaseButton,
+    ReleaseKey,
+    Scroll,
+    TypeText,
 )
 
 _BUTTON_MAP: dict[str, Button] = {
@@ -47,13 +54,26 @@ _KEY_MAP: dict[Key, PynputKey] = {
     Key.caps_lock: PynputKey.caps_lock,
     Key.num_lock: PynputKey.num_lock,
     Key.scroll_lock: PynputKey.scroll_lock,
-    Key.f1: PynputKey.f1, Key.f2: PynputKey.f2, Key.f3: PynputKey.f3,
-    Key.f4: PynputKey.f4, Key.f5: PynputKey.f5, Key.f6: PynputKey.f6,
-    Key.f7: PynputKey.f7, Key.f8: PynputKey.f8, Key.f9: PynputKey.f9,
-    Key.f10: PynputKey.f10, Key.f11: PynputKey.f11, Key.f12: PynputKey.f12,
-    Key.f13: PynputKey.f13, Key.f14: PynputKey.f14, Key.f15: PynputKey.f15,
-    Key.f16: PynputKey.f16, Key.f17: PynputKey.f17, Key.f18: PynputKey.f18,
-    Key.f19: PynputKey.f19, Key.f20: PynputKey.f20,
+    Key.f1: PynputKey.f1,
+    Key.f2: PynputKey.f2,
+    Key.f3: PynputKey.f3,
+    Key.f4: PynputKey.f4,
+    Key.f5: PynputKey.f5,
+    Key.f6: PynputKey.f6,
+    Key.f7: PynputKey.f7,
+    Key.f8: PynputKey.f8,
+    Key.f9: PynputKey.f9,
+    Key.f10: PynputKey.f10,
+    Key.f11: PynputKey.f11,
+    Key.f12: PynputKey.f12,
+    Key.f13: PynputKey.f13,
+    Key.f14: PynputKey.f14,
+    Key.f15: PynputKey.f15,
+    Key.f16: PynputKey.f16,
+    Key.f17: PynputKey.f17,
+    Key.f18: PynputKey.f18,
+    Key.f19: PynputKey.f19,
+    Key.f20: PynputKey.f20,
     Key.menu: PynputKey.menu,
     Key.pause: PynputKey.pause,
     Key.print_screen: PynputKey.print_screen,
@@ -196,7 +216,7 @@ class InputManager:
                 type=INPUT_KEYBOARD,
                 ki=KEYBDINPUT(0, code_unit, KEYEVENTF_UNICODE | flags, 0, None),
             )
-            ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+            ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))  # type: ignore[attr-defined]
 
         # encode as UTF-16 so characters outside the BMP (e.g. some
         # emoji) are sent as the correct surrogate pair, matching what

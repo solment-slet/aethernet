@@ -1,11 +1,11 @@
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from aethernet import EncryptionMode
 from aethernet.transport import AggregatingLink
-from aethernet.transport.medium_transport import MediumTransport
 from aethernet.transport.low_transport import LowTransportConfig
+from aethernet.transport.medium_transport import MediumTransport
 
 ENCRYPTION_KEY = b"\x00" * 32
 

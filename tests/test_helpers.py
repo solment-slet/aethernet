@@ -1,16 +1,16 @@
-import pytest
 import httpx
+import pytest
 from hypothesis import given, strategies as st
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
-from aethernet.transport.http_over_link.http_over_link import _headers_to_list
-from aethernet.transport.ws_over_link.ws_over_link import (
-    _normalize_headers,
-    _make_connection_closed,
-)
+from aethernet.http.common import headers_to_list
 from aethernet.transport.utils import (
-    encode_json_bytes,
     decode_json_bytes,
+    encode_json_bytes,
+)
+from aethernet.ws.client import (
+    _make_connection_closed,
+    _normalize_headers,
 )
 
 
@@ -44,26 +44,26 @@ def test_make_connection_closed_error():
 
 
 # ======================================================================
-# _headers_to_list
+# headers_to_list
 # ======================================================================
 
 
 def test_none_returns_empty():
-    assert _headers_to_list(None) == []
+    assert headers_to_list(None) == []
 
 
 def test_plain_list_returned_as_is():
     h = [("a", "1"), ("b", "2")]
-    assert _headers_to_list(h) == [("a", "1"), ("b", "2")]
+    assert headers_to_list(h) == [("a", "1"), ("b", "2")]
 
 
 def test_empty_list_returned_as_is():
-    assert _headers_to_list([]) == []
+    assert headers_to_list([]) == []
 
 
 def test_httpx_headers_converted():
     h = httpx.Headers({"content-type": "application/json", "x-foo": "bar"})
-    result = _headers_to_list(h)
+    result = headers_to_list(h)
     assert ("content-type", "application/json") in result
     assert ("x-foo", "bar") in result
 
@@ -85,21 +85,21 @@ header_list = st.lists(header_pair, min_size=0, max_size=20)
 @given(headers=header_list)
 def test_plain_list_roundtrip(headers):
     """Список кортежей возвращается без изменений."""
-    result = _headers_to_list(headers)
+    result = headers_to_list(headers)
     assert result == headers
 
 
 @given(headers=header_list)
 def test_result_is_always_list(headers):
     """Результат всегда list, независимо от входа."""
-    assert isinstance(_headers_to_list(headers), list)
-    assert isinstance(_headers_to_list(None), list)
+    assert isinstance(headers_to_list(headers), list)
+    assert isinstance(headers_to_list(None), list)
 
 
 @given(headers=header_list)
 def test_all_elements_are_tuples(headers):
     """Все элементы результата — кортежи из двух строк."""
-    for name, value in _headers_to_list(headers):
+    for name, value in headers_to_list(headers):
         assert isinstance(name, str)
         assert isinstance(value, str)
 
@@ -107,4 +107,4 @@ def test_all_elements_are_tuples(headers):
 @given(headers=header_list)
 def test_length_preserved_for_list(headers):
     """Длина результата совпадает с длиной входного списка."""
-    assert len(_headers_to_list(headers)) == len(headers)
+    assert len(headers_to_list(headers)) == len(headers)

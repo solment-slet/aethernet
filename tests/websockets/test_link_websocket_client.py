@@ -1,13 +1,14 @@
-import pytest
 import json
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 from websockets.exceptions import (
     ConnectionClosed,
-    ConnectionClosedOK,
     ConnectionClosedError,
+    ConnectionClosedOK,
 )
 
-from aethernet.transport.ws_over_link.ws_over_link import LinkWebSocketClient
+from aethernet.ws.client import LinkWebSocketClient
 from tests.helpers import meta_frame
 
 # ======================================================================

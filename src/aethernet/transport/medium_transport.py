@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
-import os
 import logging
+import os
 import time
+import uuid
+from typing import ClassVar
 
 import basex
-from PIL import Image
-from Crypto.Cipher import ChaCha20_Poly1305, AES
-from Crypto.Cipher._mode_gcm import GcmMode
+from Crypto.Cipher import AES, ChaCha20_Poly1305
 from Crypto.Cipher._mode_eax import EaxMode
+from Crypto.Cipher._mode_gcm import GcmMode
 from Crypto.Cipher.ChaCha20_Poly1305 import ChaCha20Poly1305Cipher
+from PIL import Image
 
-from aethernet.transport.enums import EncryptionMode
 from aethernet.exceptions import TransportClosedError
+from aethernet.transport.enums import EncryptionMode
 from aethernet.transport.low_transport import LowTransport
 from aethernet.typing import LoggerLike
 
@@ -41,7 +42,7 @@ class MediumTransport:
     _AES_EAX_NONCE = 16
     _AES_EAX_TAG = 16
 
-    _OVERHEAD: dict[EncryptionMode, tuple[int, int]] = {
+    _OVERHEAD: ClassVar[dict[EncryptionMode, tuple[int, int]]] = {
         EncryptionMode.CHACHA20_POLY1305: (_CHACHA_NONCE, _CHACHA_TAG),
         EncryptionMode.AES_GCM: (_AES_GCM_NONCE, _AES_GCM_TAG),
         EncryptionMode.AES_EAX: (_AES_EAX_NONCE, _AES_EAX_TAG),
@@ -52,18 +53,21 @@ class MediumTransport:
         transport: LowTransport,
         encryption_mode: EncryptionMode = EncryptionMode.NONE,
         encryption_key: bytes | None = None,
-        logger: LoggerLike = logging.getLogger(__name__),
+        logger: LoggerLike | None = None,
     ) -> None:
         MediumTransport._validate_key(encryption_key, encryption_mode)
         self.low_transport = transport
         self.config = self.low_transport.config
-        self._logger = logger
+        self._logger = logger if logger is not None else logging.getLogger(__name__)
         self._mode = self.config.mode
         self._encryption_mode = encryption_mode
         self._key: bytes = encryption_key if encryption_key is not None else b""
 
-        self._basex = basex.init(alphabet=self.config.alphabet) if self.config.alphabet else None
+        self._basex = (
+            basex.init(alphabet=self.config.alphabet) if self.config.alphabet else None
+        )
         self.max_message_chars = self.config.max_message_chars
+        self.max_payload_bytes: int
 
         if self._mode == "string" and self.config.max_message_bytes is None:
             self.max_payload_bytes = self._calc_max_payload_bytes()
@@ -74,10 +78,8 @@ class MediumTransport:
                 "max_message_bytes must be set in config when mode is not 'string'"
             )
 
-        logger.debug(
-            f"{self._mode=}\n"
-            f"{self.max_payload_bytes=}\n"
-            f"{self._encryption_mode=}"
+        self._logger.debug(
+            f"{self._mode=}\n{self.max_payload_bytes=}\n{self._encryption_mode=}"
         )
 
     # ============================================================
@@ -91,7 +93,9 @@ class MediumTransport:
     def send_image(self, image: Image.Image, stream_id: uuid.UUID) -> None:
         self.low_transport.send((image, stream_id))
 
-    def recv(self, recv_restart_delay: float = 0.01) -> bytes | tuple[Image.Image, uuid.UUID]:
+    def recv(
+        self, recv_restart_delay: float = 0.01
+    ) -> bytes | tuple[Image.Image, uuid.UUID]:
         while True:
             try:
                 data = self.low_transport.recv()
@@ -102,6 +106,7 @@ class MediumTransport:
                     and isinstance(data[0], Image.Image)
                     and isinstance(data[1], uuid.UUID)
                 ):
+                    # noinspection PyTypeChecker
                     return data  # (Image.Image, uuid.UUID) — пробрасываем как есть
                 # ── bytes / str ──────────────────────────────────────────────
                 if isinstance(data, (str, bytes)):
@@ -152,12 +157,14 @@ class MediumTransport:
             payload = nonce + tag + ciphertext
 
         if self._mode == "string":
+            if self._basex is None:
+                raise TypeError("_basex is not set")
             return self._basex.encode(payload)
 
         return payload
 
     def _decode(self, data: str | bytes) -> bytes:
-        payload = self._basex.decode(data) if isinstance(data, str) else data
+        payload = self._basex.decode(data) if isinstance(data, str) else data  # type: ignore [union-attr]
 
         if self._encryption_mode == EncryptionMode.NONE:
             return payload
@@ -177,6 +184,8 @@ class MediumTransport:
         """
         Returns the basex-encoded string length for a worst-case payload.
         """
+        if self._basex is None:
+            raise TypeError("_basex is not set")
         payload_len = self._encryption_overhead() + data_len
         return max(
             len(self._basex.encode(b"\x00" * payload_len)),
@@ -196,7 +205,7 @@ class MediumTransport:
         c = self.max_message_chars
 
         low = 0
-        high = c # rough upper bound (definitely not larger)
+        high = c  # rough upper bound (definitely not larger)
 
         while low < high:
             mid = (low + high + 1) // 2

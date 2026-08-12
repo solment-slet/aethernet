@@ -23,12 +23,13 @@ ENV/
 .uv/
 uv.lock
 
-# Тесты и покрытие
+# Тесты, покрытие и профилировщики
 .pytest_cache/
 .coverage*
 htmlcov/
 .tox/
 .hypothesis/
+/profile.svg
 
 # Линтеры
 .mypy_cache/
@@ -36,6 +37,12 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# NiceGUI
+.nicegui/
+
+# aethernet_link для тестов
+/aethernet_link.py
 
 # Редакторы
 .idea/

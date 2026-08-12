@@ -1,11 +1,14 @@
-import time
 import asyncio
+import time
+from collections.abc import Callable
+from typing import Any
 
-from aethernet.stasis.actions import Action, Delay, SetClipboard, GetClipboard
-from aethernet.stasis.managers.input_manager import InputManager
+from aethernet.stasis.actions import Action, Delay, GetClipboard, SetClipboard
 from aethernet.stasis.managers.clipboard_manager import ClipboardManager
+from aethernet.stasis.managers.input_manager import InputManager
 
-_INPUT_HANDLERS = {
+# noinspection PyTypeChecker
+_INPUT_HANDLERS: dict[str, Callable[[InputManager, Any], None]] = {
     "move_mouse": InputManager.move_mouse,
     "click_button": InputManager.click_button,
     "press_button": InputManager.press_button,
@@ -22,7 +25,9 @@ class ActionExecutor:
     thread, so that ordering and Delay timing are preserved exactly as
     recorded, without event-loop scheduling jitter between actions."""
 
-    def __init__(self, input_manager: InputManager, clipboard_manager: ClipboardManager) -> None:
+    def __init__(
+        self, input_manager: InputManager, clipboard_manager: ClipboardManager
+    ) -> None:
         self._input = input_manager
         self._clipboard = clipboard_manager
 

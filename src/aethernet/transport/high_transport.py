@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import struct
 import time
 import uuid
-import logging
 from collections import deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any
 
 import msgpack
 from PIL import Image
 
-from aethernet.transport.enums import ReliabilityMode
 from aethernet.exceptions import StreamClosed, TransportClosedError
-from aethernet.typing import LoggerLike
+from aethernet.transport.enums import ReliabilityMode
 from aethernet.transport.medium_transport import MediumTransport
+from aethernet.typing import LoggerLike
 
 
 @dataclass(slots=True)
@@ -224,7 +225,7 @@ class AggregatingLink:
         self,
         transport: MediumTransport,
         *,
-        logger: LoggerLike = logging.getLogger(__name__),
+        logger: LoggerLike | None = None,
         flush_interval: float = 0.5,
         max_batch_size: int = 64 * 1024,
         chunk_assembly_ttl: float = 60.0,
@@ -259,7 +260,7 @@ class AggregatingLink:
                 Защита от бесконечного роста если пакет потерян навсегда.
                 На практике не срабатывает — ретрансмит бесконечный.
         """
-        self._logger = logger
+        self._logger = logger if logger is not None else logging.getLogger(__name__)
         self._transport = transport
         self._config = self._transport.config
 
@@ -290,7 +291,7 @@ class AggregatingLink:
             self.SINGLE_MAGIC
         )
         self._chunk_packet_payload_limit = (
-                self._transport_limit - len(self.CHUNK_MAGIC) - self._CHUNK_META_STRUCT.size
+            self._transport_limit - len(self.CHUNK_MAGIC) - self._CHUNK_META_STRUCT.size
         )
         self._agp1_payload_limit = self._transport_limit - _MIN_PACKET_HEADER_SIZE
 
@@ -313,8 +314,8 @@ class AggregatingLink:
         # + полном наборе ACK физический пакет может превысить
         # transport.max_payload_bytes — а chunking для AGP1 не реализован.
         self._agp1_max_logical_payload = (
-                self._agp1_payload_limit - ack_batch_size * _ACK_SEQ_STRUCT.size
-        ) + 64 # страховка
+            self._agp1_payload_limit - ack_batch_size * _ACK_SEQ_STRUCT.size
+        ) + 64  # страховка
         if self._agp1_max_logical_payload <= 0:
             raise ValueError(
                 "transport.max_payload_bytes too small for AGP1 framing "
@@ -322,7 +323,9 @@ class AggregatingLink:
             )
 
         if reliability_mode == ReliabilityMode.NONE:
-            self._max_batch_size = min(max_batch_size, self._single_packet_payload_limit)
+            self._max_batch_size = min(
+                max_batch_size, self._single_packet_payload_limit
+            )
         else:
             self._max_batch_size = min(max_batch_size, self._agp1_max_logical_payload)
 
@@ -437,10 +440,10 @@ class AggregatingLink:
             self._closed = True
             self._stop_event.set()
 
-            for queue in self._data_loss_subscribers:
-                queue.put_nowait(None)
-            for queue in self._stream_notification_subscribers:
-                queue.put_nowait(None)
+            for data_loss_queue in self._data_loss_subscribers:
+                data_loss_queue.put_nowait(None)
+            for stream_queue in self._stream_notification_subscribers:
+                stream_queue.put_nowait(None)
 
             try:
                 await asyncio.to_thread(self._transport.low_transport.close)
@@ -499,11 +502,7 @@ class AggregatingLink:
             while True:
                 get_task = asyncio.ensure_future(queue.get())
                 stop_task = asyncio.ensure_future(self._stop_event.wait())
-                done, pending = await asyncio.wait(
-                    {get_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
-                )
-                for t in pending:
-                    t.cancel()
+                done, _pending = await self._race_with_stop(get_task, stop_task)
 
                 if stop_task in done:
                     raise StreamClosed("link closed while waiting for a new stream")
@@ -570,11 +569,7 @@ class AggregatingLink:
 
         get_task = asyncio.ensure_future(queue.get())
         stop_task = asyncio.ensure_future(self._stop_event.wait())
-        done, pending = await asyncio.wait(
-            {get_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
+        done, _pending = await self._race_with_stop(get_task, stop_task)
 
         if stop_task in done:
             raise StreamClosed(f"link closed while waiting for stream {stream_id}")
@@ -628,8 +623,8 @@ class AggregatingLink:
             raise RuntimeError("AggregatingLink.start() must be called first")
 
         if (
-                self._image_reliability_mode != ReliabilityMode.NONE
-                and stream_id in self._image_ack_events
+            self._image_reliability_mode != ReliabilityMode.NONE
+            and stream_id in self._image_ack_events
         ):
             raise RuntimeError(
                 f"Another send_image is already in progress for stream {stream_id!r}"
@@ -668,7 +663,7 @@ class AggregatingLink:
                         timeout=self._delay_before_resending,
                     )
                     return  # ACK получен
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue
 
         finally:
@@ -761,7 +756,9 @@ class AggregatingLink:
                 protocol=_IMAGE_PROTOCOL,
             )
             self._dispatch_image_frame(frame)
-            self._logger.debug(f"Dispatched image uuid={uuid_key[:8]}… to stream {stream_id!r}")
+            self._logger.debug(
+                f"Dispatched image uuid={uuid_key[:8]}… to stream {stream_id!r}"
+            )
 
         # ACK отправляем в любом случае (дубликат или нет) — отправитель мог
         # не получить предыдущий ACK и поэтому ретрансмитит.
@@ -1161,7 +1158,7 @@ class AggregatingLink:
                         next_frame = await asyncio.wait_for(
                             self._outgoing.get(), timeout=timeout
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         break
 
                     next_estimate = self._estimate_frame_size(next_frame)
@@ -1188,7 +1185,9 @@ class AggregatingLink:
                     asyncio.create_task(self.close())
                     return
                 except Exception:
-                    self._logger.exception("Error when sending a message via medium_transport.")
+                    self._logger.exception(
+                        "Error when sending a message via medium_transport."
+                    )
                     await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
@@ -1341,7 +1340,7 @@ class AggregatingLink:
                         self._has_pending_acks.wait(),
                         timeout=self._ack_flush_interval,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
 
                 if self._pending_acks.empty():
@@ -1481,6 +1480,31 @@ class AggregatingLink:
             )
             del self._chunk_assemblies[msg_id]
 
+    @staticmethod
+    async def _race_with_stop(
+        awaitable_task: asyncio.Task,
+        stop_task: asyncio.Task,
+    ) -> tuple[set[asyncio.Task], set[asyncio.Task]]:
+        """Гонка между тасками с гарантированной отменой проигравшего,
+        даже если сама эта корутина будет отменена снаружи."""
+        try:
+            done, pending = await asyncio.wait(
+                {awaitable_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            # Нас саму отменили, пока мы ждали asyncio.wait — оба таска
+            # могли остаться недоделанными, чистим их принудительно.
+            awaitable_task.cancel()
+            stop_task.cancel()
+            await asyncio.gather(awaitable_task, stop_task, return_exceptions=True)
+            raise
+
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        return done, pending
+
     # ------------------------------------------------------------------
     # Batch encoding / decoding
     # ------------------------------------------------------------------
@@ -1508,12 +1532,12 @@ class AggregatingLink:
         items = msgpack.unpackb(raw, raw=False)
 
         if not isinstance(items, list):
-            raise ValueError("batch must be a list")
+            raise TypeError("batch must be a list")
 
         frames: list[Frame] = []
         for item in items:
             if not isinstance(item, dict):
-                raise ValueError("frame must be dict")
+                raise TypeError("frame must be dict")
 
             stream_id = item["s"]
             frame_type = item["t"]
@@ -1522,13 +1546,13 @@ class AggregatingLink:
             protocol = item.get("pr")
 
             if not isinstance(stream_id, str):
-                raise ValueError("stream_id must be str")
+                raise TypeError("stream_id must be str")
             if not isinstance(frame_type, str):
-                raise ValueError("frame_type must be str")
+                raise TypeError("frame_type must be str")
             if not isinstance(payload, (bytes, bytearray)):
-                raise ValueError("payload must be bytes")
+                raise TypeError("payload must be bytes")
             if protocol is not None and not isinstance(protocol, str):
-                raise ValueError("protocol must be str or None")
+                raise TypeError("protocol must be str or None")
 
             frames.append(
                 Frame(

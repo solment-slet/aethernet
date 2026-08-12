@@ -1,7 +1,10 @@
 import asyncio
 
-from aethernet import get_link, ReliabilityMode
-from aethernet.low_transports.aethernet_tcp_transport import TCPLowTransport, TCPLowTransportServer
+from aethernet import ReliabilityMode, get_link
+from aethernet.low_transports.aethernet_tcp_transport import (
+    TCPLowTransport,
+    TCPLowTransportServer,
+)
 
 
 async def create_link(mode, logger):

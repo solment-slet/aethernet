@@ -1,22 +1,22 @@
-import uuid
-import signal
 import asyncio
 import logging
+import signal
+import uuid
 from typing import get_args
 
-from aethernet.typing import LoggerLike
 from aethernet.exceptions import StreamClosed
-from aethernet.transport.enums import ReliabilityMode
-from aethernet.transport import AggregatingLink, Frame
 from aethernet.stasis.actions import action_from_dict
+from aethernet.stasis.common import PROTOCOL_NAME
 from aethernet.stasis.dataclasses import StreamMode, StreamModes
-from aethernet.stasis.managers.screen_manager import ScreenManager
-from aethernet.stasis.managers.input_manager import InputManager
-from aethernet.stasis.managers.clipboard_manager import ClipboardManager
 from aethernet.stasis.managers.action_executor import ActionExecutor
-from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
+from aethernet.stasis.managers.clipboard_manager import ClipboardManager
+from aethernet.stasis.managers.input_manager import InputManager
+from aethernet.stasis.managers.screen_manager import ScreenManager
+from aethernet.transport import AggregatingLink, Frame
+from aethernet.transport.enums import ReliabilityMode
+from aethernet.transport.utils import decode_json_bytes, encode_json_bytes
+from aethernet.typing import LoggerLike
 
-PROTOCOL_NAME = "stasis"
 
 class AethernetStasisServer:
     _SECONDS_TO_RECOVERY_STREAM_LOOP_AFTER_EXCEPTION = 5
@@ -25,10 +25,10 @@ class AethernetStasisServer:
         self,
         link: AggregatingLink,
         *,
-        logger: LoggerLike = logging.getLogger(__name__),
+        logger: LoggerLike | None = None,
     ) -> None:
         self._link = link
-        self._logger = logger
+        self._logger = logger if logger is not None else logging.getLogger(__name__)
         self._screen_request_event = asyncio.Event()
         self._mode_changed_event = asyncio.Event()
         self._dispatcher_task: asyncio.Task[None] | None = None
@@ -112,20 +112,32 @@ class AethernetStasisServer:
         try:
             frame = await self._link.recv_frame(stream_id)
 
-            if self.connected and self.session_id:
+            if frame.frame_type != "connect" and self.connected and self.session_id:
                 await self._handle_frame(frame)
                 return
 
-            if frame.frame_type != "meta":
+            if frame.frame_type != "connect":
                 await self._send_error(
-                    "protocol_error", "Expected connect_request meta frame.", stream_id,
+                    "protocol_error",
+                    "Expected connect_request connect frame.",
+                    stream_id,
                 )
                 return
+
+            if frame.frame_type == "connect" and self.connected and self.session_id:
+                # This is necessary so that if the client disconnects from the session without
+                # sending a disconnect message, they won’t have to send a disconnect packet.
+                await self._reset_session()
+                self._logger.warning(
+                    "The request to connect to an already occupied session has been accepted."
+                )
 
             meta = decode_json_bytes(frame.payload)
             if meta.get("kind") != "connect_request":
                 await self._send_error(
-                    "protocol_error", "Expected connect_request kind.", stream_id,
+                    "protocol_error",
+                    "Expected connect_request kind.",
+                    stream_id,
                 )
                 return
 
@@ -167,7 +179,7 @@ class AethernetStasisServer:
                         "stream_mode": {
                             "mode": self.stream_mode.mode,
                             "interval_ms": self.stream_mode.interval_ms,
-                        }
+                        },
                     }
                 ),
             )
@@ -177,7 +189,8 @@ class AethernetStasisServer:
             self._screen_request_event.clear()
             self._mode_changed_event.clear()
             self._stream_task = asyncio.create_task(
-                self._stream_loop(), name=f"AethernetStasisServer.stream_loop.{self.session_id}"
+                self._stream_loop(),
+                name=f"AethernetStasisServer.stream_loop.{self.session_id}",
             )
             self._stream_task.add_done_callback(self._log_task_result)
             self._logger.info(f"New connection has been established: {self.session_id}")
@@ -191,7 +204,9 @@ class AethernetStasisServer:
         json = decode_json_bytes(frame.payload)
         kind = json["kind"]
         if json.get("session_id") != self.session_id and kind != "disconnect":
-            await self._send_error("invalid_session_error", "The session ID is missing or invalid.")
+            await self._send_error(
+                "invalid_session_error", "The session ID is missing or invalid."
+            )
             return
 
         if kind == "disconnect":
@@ -206,7 +221,9 @@ class AethernetStasisServer:
                 await self._send_error("protocol_error", "The 'mode' field is missing.")
                 return
             if not mode in get_args(StreamModes):
-                await self._send_error("protocol_error", f"Unknown stream mode '{mode}'.")
+                await self._send_error(
+                    "protocol_error", f"Unknown stream mode '{mode}'."
+                )
                 return
             if mode == "interval" and not isinstance(interval_ms, int):
                 await self._send_error(
@@ -221,7 +238,9 @@ class AethernetStasisServer:
             # Execute Actions
             raw_actions = json.get("actions")
             if not raw_actions:
-                await self._send_error("protocol_error", "The 'actions' field is missing.")
+                await self._send_error(
+                    "protocol_error", "The 'actions' field is missing."
+                )
                 return
 
             try:
@@ -234,18 +253,23 @@ class AethernetStasisServer:
                 results = await self._action_executor.execute(actions)
             except Exception as e:
                 await self._send_error(
-                    "execution_error", f"{type(e).__name__}: {e}",
+                    "execution_error",
+                    f"{type(e).__name__}: {e}",
                 )
                 return
 
             if results:
+                if self.callbacks_stream_id is None:
+                    raise TypeError("callbacks_stream_id is None")
                 await self._link.send_frame(
                     self.callbacks_stream_id,
                     "data",
-                    encode_json_bytes({
-                        "kind": "clipboard",
-                        "clipboard": results,
-                    }),
+                    encode_json_bytes(
+                        {
+                            "kind": "clipboard",
+                            "clipboard": results,
+                        }
+                    ),
                     protocol=PROTOCOL_NAME,
                 )
         elif kind == "screen_request":
@@ -262,7 +286,9 @@ class AethernetStasisServer:
 
                 if mode.mode == "on_request":
                     self._screen_request_event.clear()
-                    request_wait = asyncio.create_task(self._screen_request_event.wait())
+                    request_wait = asyncio.create_task(
+                        self._screen_request_event.wait()
+                    )
                     mode_wait = asyncio.create_task(self._mode_changed_event.wait())
                     done, pending = await asyncio.wait(
                         {request_wait, mode_wait}, return_when=asyncio.FIRST_COMPLETED
@@ -274,14 +300,16 @@ class AethernetStasisServer:
                         continue
                     await self._send_screenshot()
 
-                else: # interval
-                    interval_s = mode.interval_ms / 1000
+                else:  # interval
+                    interval_s = mode.interval_ms / 1000  # type: ignore [operator]
                     self._logger.debug("[loop] waiting for interval/mode_change")
                     mode_wait = asyncio.create_task(self._mode_changed_event.wait())
                     try:
-                        await asyncio.wait_for(asyncio.shield(mode_wait), timeout=interval_s)
+                        await asyncio.wait_for(
+                            asyncio.shield(mode_wait), timeout=interval_s
+                        )
                         self._mode_changed_event.clear()
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         self._logger.debug("[loop] timeout -> sending screenshot")
                         await self._send_screenshot()
                         self._logger.debug("[loop] screenshot sent, looping back")
@@ -300,7 +328,7 @@ class AethernetStasisServer:
                 await self._send_error("internal_error", message)
                 await asyncio.sleep(
                     AethernetStasisServer._SECONDS_TO_RECOVERY_STREAM_LOOP_AFTER_EXCEPTION,
-                ) # anti-tight loop
+                )  # anti-tight loop
 
     async def _send_screenshot(self) -> None:
         if self.screen_stream_id is None:
@@ -319,6 +347,8 @@ class AethernetStasisServer:
         await self._link.send_image(self.screen_stream_id, image)
 
     async def _send_callback(self, frame_type: str, payload: bytes = b"") -> None:
+        if self.callbacks_stream_id is None:
+            raise TypeError("callbacks_stream_id is None")
         await self._link.send_frame(
             self.callbacks_stream_id,
             frame_type,
@@ -326,9 +356,19 @@ class AethernetStasisServer:
             protocol=PROTOCOL_NAME,
         )
 
-    async def _send_error(self, reason: str, message: str, stream_id: str | None = None, *, log: bool = True) -> None:
+    async def _send_error(
+        self,
+        reason: str,
+        message: str,
+        stream_id: str | None = None,
+        *,
+        log: bool = True,
+    ) -> None:
         if log:
             self._logger.error(f"Sending error: {message}")
+        if self.callbacks_stream_id is None:
+            raise TypeError("callbacks_stream_id is None")
+
         await self._link.send_frame(
             stream_id or self.callbacks_stream_id,
             "error",

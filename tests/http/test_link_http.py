@@ -1,14 +1,14 @@
-import pytest
-import json
 import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock
+
 import httpx
-from unittest.mock import MagicMock, AsyncMock
-from aethernet.transport.http_over_link.http_over_link import (
-    LinkResponseByteStream,
-    AethernetHttpx,
-    LinkHTTPProxyServer,
-)
-from ..helpers import meta_payload, make_frame_with_end
+import pytest
+
+from aethernet.http.client import AethernetHttpx, LinkResponseByteStream
+from aethernet.http.server import LinkHTTPProxyServer
+
+from ..helpers import make_frame_with_end, meta_payload
 
 # ======================================================================
 # LinkResponseByteStream

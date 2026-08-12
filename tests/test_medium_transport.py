@@ -1,10 +1,12 @@
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
 from hypothesis import given, strategies as st
 
-from aethernet.transport.enums import EncryptionMode
-from aethernet.transport import MediumTransport
 from aethernet.exceptions import TransportClosedError
+from aethernet.transport import MediumTransport
+from aethernet.transport.enums import EncryptionMode
+
 from .conftest import ENCRYPTION_KEY
 
 # ======================================================================

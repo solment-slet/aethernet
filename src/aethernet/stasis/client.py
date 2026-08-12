@@ -1,27 +1,33 @@
 import asyncio
 import logging
-from typing import Any
 from dataclasses import asdict
+from typing import Any, TypeGuard
 
 from PIL import Image
 
 from aethernet.exceptions import StreamClosed
 from aethernet.stasis.actions import Action
-from aethernet.stasis.server import PROTOCOL_NAME
-from aethernet.stasis.managers.clipboard_manager import ClipboardManager
-from aethernet.stasis.dataclasses import StreamMode, StreamModes, ServerMetadata, RemoteHostMetadata
+from aethernet.stasis.common import PROTOCOL_NAME
+from aethernet.stasis.dataclasses import (
+    RemoteHostMetadata,
+    ServerMetadata,
+    StreamMode,
+    StreamModes,
+)
 from aethernet.stasis.exceptions import (
-    LocalDeviceError,
     ConnectionRejectedError,
+    ExecutionError,
+    InternalError,
+    InvalidSessionError,
+    LocalDeviceError,
     LocalDeviceProtocolError,
+    NotConnectedError,
     RemoteDeviceError,
     RemoteDeviceProtocolError,
-    InvalidSessionError,
-    NotConnectedError,
-    InternalError, ExecutionError,
 )
+from aethernet.stasis.managers.clipboard_manager import ClipboardManager
 from aethernet.transport import AggregatingLink, Frame
-from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
+from aethernet.transport.utils import decode_json_bytes, encode_json_bytes
 from aethernet.typing import LoggerLike
 
 
@@ -34,17 +40,17 @@ class AethernetStasisClient:
         self,
         link: AggregatingLink,
         *,
-        logger: LoggerLike = logging.getLogger(__name__),
+        logger: LoggerLike | None = None,
     ) -> None:
         self._link = link
-        self._logger = logger
+        self._logger = logger if logger is not None else logging.getLogger(__name__)
         self._callback_task: asyncio.Task[None] | None = None
         self._callbacks_queue: asyncio.Queue[Frame] = asyncio.Queue(
             maxsize=AethernetStasisClient._CALLBACKS_QUEUE_MAXSIZE,
-        ) # Messages sent by the server via callbacks_stream_id, without errors.
+        )  # Messages sent by the server via callbacks_stream_id, without errors.
         self._errors_queue: asyncio.Queue[Exception] = asyncio.Queue(
             maxsize=AethernetStasisClient._ERRORS_QUEUE_MAXSIZE,
-        ) # Errors sent by the server via callbacks_stream_id
+        )  # Errors sent by the server via callbacks_stream_id
 
         self.clipboard = ClipboardManager()
         self.connected = False
@@ -68,10 +74,12 @@ class AethernetStasisClient:
 
         await self._link.send_frame(
             stream_id,
-            "meta",
-            encode_json_bytes({
-                "kind": "connect_request",
-            }),
+            "connect",
+            encode_json_bytes(
+                {
+                    "kind": "connect_request",
+                }
+            ),
             end=True,
             protocol=PROTOCOL_NAME,
         )
@@ -87,7 +95,11 @@ class AethernetStasisClient:
         if kind != "connect_response":
             raise LocalDeviceProtocolError(f"Expected connect_response, got {kind!r}")
         if status != "accepted":
-            raise ConnectionRejectedError(message=meta.get("message", "The server rejected the connection request."))
+            raise ConnectionRejectedError(
+                message=meta.get(
+                    "message", "The server rejected the connection request."
+                )
+            )
 
         try:
             self.session_id = meta["session_id"]
@@ -105,12 +117,15 @@ class AethernetStasisClient:
                 ),
             )
         except KeyError as e:
-            raise LocalDeviceProtocolError(f"The server response is missing the {e.args[0]} key.")
+            raise LocalDeviceProtocolError(
+                f"The server response is missing the {e.args[0]} key."
+            )
 
         self.screen_stream_id = stream_id
         self.connected = True
         self._callback_task = asyncio.create_task(
-            self._callback_loop(), name=f"AethernetStasisClient.callback_loop.{self.session_id}"
+            self._callback_loop(),
+            name=f"AethernetStasisClient.callback_loop.{self.session_id}",
         )
 
         return self.server_metadata
@@ -121,10 +136,12 @@ class AethernetStasisClient:
         await self._link.send_frame(
             stream_id,
             "meta",
-            encode_json_bytes({
-                "kind": "disconnect",
-                "session_id": self.session_id,
-            }),
+            encode_json_bytes(
+                {
+                    "kind": "disconnect",
+                    "session_id": self.session_id,
+                }
+            ),
             end=True,
             protocol=PROTOCOL_NAME,
         )
@@ -133,6 +150,8 @@ class AethernetStasisClient:
     async def get_screen(self) -> Image.Image:
         """Returns the latest screen image without returning the old ones, even if they were not received."""
         self._logger.debug("Receiving a screen image.")
+        if self.screen_stream_id is None:
+            raise TypeError("screen_stream_id is None")
         return await self._link.recv_image(self.screen_stream_id)
 
     async def get_error(self) -> Exception:
@@ -148,11 +167,13 @@ class AethernetStasisClient:
         await self._link.send_frame(
             stream_id,
             "data",
-            encode_json_bytes({
-                "kind": "execute_actions",
-                "session_id": self.session_id,
-                "actions": [asdict(a) for a in actions],
-            }),
+            encode_json_bytes(
+                {
+                    "kind": "execute_actions",
+                    "session_id": self.session_id,
+                    "actions": [asdict(a) for a in actions],
+                }
+            ),
             end=True,
             protocol=PROTOCOL_NAME,
         )
@@ -163,24 +184,27 @@ class AethernetStasisClient:
         await self._link.send_frame(
             stream_id,
             "meta",
-            payload=encode_json_bytes({
-                "kind": "screen_request",
-                "session_id": self.session_id,
-            }),
+            payload=encode_json_bytes(
+                {
+                    "kind": "screen_request",
+                    "session_id": self.session_id,
+                }
+            ),
             end=True,
             protocol=PROTOCOL_NAME,
         )
 
-    async def set_stream_mode(self, mode: StreamModes, interval_ms: int | None = None) -> None:
+    async def set_stream_mode(
+        self, mode: StreamModes, interval_ms: int | None = None
+    ) -> None:
         self._check_connect()
         stream_id = self._link.new_stream_id()
-        json = {
+        json: dict[str, Any] = {
             "kind": "set_stream_mode",
             "session_id": self.session_id,
             "mode": mode,
         }
         if interval_ms is not None:
-            # noinspection PyTypeChecker
             json["interval_ms"] = interval_ms
         await self._link.send_frame(
             stream_id,
@@ -191,22 +215,33 @@ class AethernetStasisClient:
         )
 
     async def _callback_loop(self) -> None:
+        if self.callbacks_stream_id is None:
+            raise TypeError("callbacks_stream_id is None")
+
         while self.connected:
             try:
                 callback_frame = await self._link.recv_frame(self.callbacks_stream_id)
                 if callback_frame.frame_type == "error":
-                    err = AethernetStasisClient._handle_error(decode_json_bytes(callback_frame.payload))
+                    err = AethernetStasisClient._handle_error(
+                        decode_json_bytes(callback_frame.payload)
+                    )
                     AethernetStasisClient.put_latest(
                         self._errors_queue,
                         err,
                     )
-                    self._logger.info(f"Error message was received in the Callback Loop: {err}")
+                    self._logger.info(
+                        f"Error message was received in the Callback Loop: {err}"
+                    )
                     continue
                 elif callback_frame.frame_type == "data":
-                    def is_int_str_dict(obj):
+
+                    def is_int_str_dict(obj) -> TypeGuard[dict[int, str]]:
                         if not isinstance(obj, dict):
                             return False
-                        return all(isinstance(k, int) and isinstance(v, str) for k, v in obj.items())
+                        return all(
+                            isinstance(k, int) and isinstance(v, str)
+                            for k, v in obj.items()
+                        )
 
                     json = decode_json_bytes(callback_frame.payload)
                     if json.get("kind") == "clipboard":
@@ -214,14 +249,18 @@ class AethernetStasisClient:
                         if not is_int_str_dict(clipboard):
                             AethernetStasisClient.put_latest(
                                 self._errors_queue,
-                                LocalDeviceProtocolError("The server sent a clipboard kind without a clipboard key.")
+                                LocalDeviceProtocolError(
+                                    "The server sent a clipboard kind without a clipboard key."
+                                ),
                             )
                             continue
                         await self._handle_clipboard(clipboard)
                         continue
 
                 AethernetStasisClient.put_latest(self._callbacks_queue, callback_frame)
-                self._logger.info("Non‑error message was received in the Callback Loop.")
+                self._logger.info(
+                    "Non‑error message was received in the Callback Loop."
+                )
             except asyncio.CancelledError:
                 return
             except StreamClosed:
@@ -233,17 +272,24 @@ class AethernetStasisClient:
                     f"{type(e).__name__}: {e}"
                 )
                 self._logger.error(message)
-                AethernetStasisClient.put_latest(self._errors_queue, LocalDeviceError(message))
+                AethernetStasisClient.put_latest(
+                    self._errors_queue, LocalDeviceError(message)
+                )
                 await asyncio.sleep(
                     AethernetStasisClient._SECONDS_TO_RECOVERY_CALLBACK_LOOP_AFTER_EXCEPTION,
-                ) # anti-tight loop
+                )  # anti-tight loop
 
     def _check_connect(self) -> None:
-        if not self.connected or not self.server_metadata or not self.session_id or not self.screen_stream_id:
+        if (
+            not self.connected
+            or not self.server_metadata
+            or not self.session_id
+            or not self.screen_stream_id
+        ):
             raise NotConnectedError("This action requires a connection to the server.")
 
     async def _handle_clipboard(self, clipboard: dict[int, str]) -> None:
-        asyncio.to_thread(self.clipboard.set, clipboard[max(clipboard)])
+        await asyncio.to_thread(self.clipboard.set, clipboard[max(clipboard)])
 
     @staticmethod
     def _handle_error(json: dict) -> RemoteDeviceError:

@@ -1,7 +1,7 @@
 import uuid
 from abc import ABC, ABCMeta, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Generic, Literal, TypeVar, get_args, get_origin
+from typing import Any, Literal, TypeVar, get_args, get_origin
 
 from PIL import Image
 
@@ -11,12 +11,13 @@ type BytesAndImages = bytes | tuple[Image.Image, uuid.UUID]
 _BASE_CLASS = None
 
 TransportData = TypeVar(
-    'TransportData',
+    "TransportData",
     str,
     bytes,
     StrAndImages,
     BytesAndImages,
 )
+
 
 @dataclass(slots=True)
 class LowTransportConfig:
@@ -32,7 +33,13 @@ class LowTransportConfig:
 
 
 class LowTransportMeta(ABCMeta):
-    def __new__(mcs, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs: Any) -> Any:
+    def __new__(
+        mcs,
+        name: str,
+        bases: tuple[type, ...],
+        namespace: dict[str, Any],
+        **kwargs: Any,
+    ) -> Any:
         cls = super().__new__(mcs, name, bases, namespace, **kwargs)
 
         global _BASE_CLASS
@@ -53,7 +60,10 @@ class LowTransportMeta(ABCMeta):
                 break
 
         # Validation 1: Forbid passing the raw TypeVar 'TransportData' itself
-        if isinstance(generic_type, TypeVar) and generic_type.__name__ == 'TransportData':
+        if (
+            isinstance(generic_type, TypeVar)
+            and generic_type.__name__ == "TransportData"
+        ):
             raise TypeError(
                 f"Class {name} cannot use the raw TypeVar 'TransportData'. "
                 f"You must specify a concrete type, e.g. LowTransport[str] or LowTransport[str_and_images]."
@@ -65,14 +75,20 @@ class LowTransportMeta(ABCMeta):
 
         # Helper to normalise Union types into a set for order-independent comparison
         def _to_set(t: Any) -> set[Any]:
-            return set(get_args(t)) if get_origin(t) is Literal or get_origin(t) is type(str | int) else {t}
+            return (
+                set(get_args(t))
+                if get_origin(t) is Literal or get_origin(t) is type(str | int)
+                else {t}
+            )
 
         if config.supports_images:
             allowed_image_types = [StrAndImages, BytesAndImages]
             # Normalise the provided type into a set so that Union order (A | B vs B | A) does not break the check
             actual_set = _to_set(generic_type)
 
-            is_valid = any(actual_set == _to_set(expected) for expected in allowed_image_types)
+            is_valid = any(
+                actual_set == _to_set(expected) for expected in allowed_image_types
+            )
 
             # Validation 2: If supports_images=True, require strictly str_and_images or bytes_and_images
             if not is_valid:
@@ -85,7 +101,7 @@ class LowTransportMeta(ABCMeta):
         return cls
 
 
-class LowTransport(Generic[TransportData], ABC, metaclass=LowTransportMeta):
+class LowTransport[TransportData](ABC, metaclass=LowTransportMeta):
     """
     Abstract base class for low-level text or byte message transport.
 
