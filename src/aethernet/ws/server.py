@@ -1,24 +1,46 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import websockets
 
+from aethernet.typing import LoggerLike
 from aethernet.transport import AggregatingLink
 from aethernet.transport.utils import encode_json_bytes, decode_json_bytes
-from aethernet.transport.ws_over_link.ws_over_link import PROTOCOL_NAME
+from aethernet.ws.ws_over_link import PROTOCOL_NAME
+
+# Поля ws_open meta, которые не передаются напрямую в websockets.connect(),
+# а обрабатываются отдельно / служебные.
+_EXCLUDED_META_FIELDS = {"uri", "kind"}
+
+# Поля, которые websockets.connect ожидает как tuple, а по JSON приходят как list.
+_TUPLE_KWARGS = {"max_size", "max_queue", "write_limit"}
 
 
 class LinkWebSocketProxyServer:
+    """
+    Серверная часть WS-over-link протокола (машина B).
+
+    Синхронизировано с ServerRouter._handle_ws:
+      - ключ URL в ws_open meta — "uri" (а не "url").
+      - все поля meta, кроме "uri"/"kind" и None-значений, прозрачно
+        прокидываются в websockets.connect(**kwargs), включая произвольные
+        параметры (headers, subprotocols, max_size, max_queue, write_limit
+        и т.д.), а не только захардкоженный набор.
+    """
+
     def __init__(
         self,
         link: AggregatingLink,
         *,
         recv_flush_interval: float = 0.2,
+        logger: LoggerLike = logging.getLogger(__name__),
     ) -> None:
         self._link = link
         self._recv_flush_interval = recv_flush_interval
+        self._logger = logger
         self._closed = False
         self._dispatcher_task: asyncio.Task[None] | None = None
 
@@ -40,40 +62,54 @@ class LinkWebSocketProxyServer:
         while not self._closed:
             stream_id = await self._link.accept_stream(PROTOCOL_NAME)
             asyncio.create_task(
-                self._try_handle_stream(stream_id), name=f"ws_proxy.{stream_id}"
+                self._handle_stream(stream_id), name=f"ws_proxy.{stream_id}"
             )
 
-    async def _try_handle_stream(self, stream_id: str) -> None:
-        """
-        Пробуем понять, это ws_open или не наш stream.
-        Если не ws_open — просто выходим, другой сервер (HTTP) обработает свой stream.
-        """
-        first = await self._link.recv_frame(stream_id)
-        if first.frame_type != "meta":
-            return
+    async def _handle_stream(self, stream_id: str) -> None:
+        try:
+            first = await self._link.recv_frame(stream_id)
+            if first.frame_type != "meta":
+                await self._send_error(stream_id, "Protocol error: expected ws_open meta")
+                return
 
-        meta = decode_json_bytes(first.payload)
-        if meta.get("kind") != "ws_open":
-            # stream не наш; в текущем дизайне это проблема,
-            # потому что мы уже съели первый frame.
-            # Ниже объясню, как правильно решить через единый router.
-            return
+            meta = decode_json_bytes(first.payload)
+            if meta.get("kind") != "ws_open":
+                await self._send_error(stream_id, f"Protocol error: expected ws_open, got {meta.get('kind')!r}")
+                return
 
-        await self._handle_ws_stream(stream_id, meta)
+            await self._handle_ws_stream(stream_id, meta)
+        except Exception as e:
+            await self._send_error(stream_id, f"{type(e).__name__}: {e}")
 
-    async def _handle_ws_stream(
-        self, stream_id: str, open_meta: dict[str, Any]
-    ) -> None:
-        url = open_meta["url"]
-        headers = [tuple(x) for x in open_meta.get("headers", [])]
-        subprotocols = open_meta.get("subprotocols", [])
+    def _build_ws_kwargs(self, open_meta: dict[str, Any]) -> dict[str, Any]:
+        ws_kwargs = {
+            k: v
+            for k, v in open_meta.items()
+            if k not in _EXCLUDED_META_FIELDS and v is not None
+        }
+
+        for key in _TUPLE_KWARGS:
+            if key in ws_kwargs and isinstance(ws_kwargs[key], list):
+                ws_kwargs[key] = tuple(ws_kwargs[key])
+
+        # headers/subprotocols приходят как списки, где нужно — приводим к tuple
+        if "additional_headers" in ws_kwargs and isinstance(ws_kwargs["additional_headers"], list):
+            ws_kwargs["additional_headers"] = [tuple(h) for h in ws_kwargs["additional_headers"]]
+        if "subprotocols" in ws_kwargs and isinstance(ws_kwargs["subprotocols"], list):
+            ws_kwargs["subprotocols"] = ws_kwargs["subprotocols"] or None
+
+        return ws_kwargs
+
+    async def _handle_ws_stream(self, stream_id: str, open_meta: dict[str, Any]) -> None:
+        uri = open_meta["uri"]
+        ws_kwargs = self._build_ws_kwargs(open_meta)
+
+        self._logger.info(f"WS proxy: connecting upstream stream={stream_id} uri={uri}")
 
         try:
-            async with websockets.connect(
-                url,
-                additional_headers=headers or None,
-                subprotocols=subprotocols or None,
-            ) as ws:
+            async with websockets.connect(uri, **ws_kwargs) as ws:
+                self._logger.debug(f"WS proxy: connected upstream stream={stream_id}")
+
                 await self._link.send_frame(
                     stream_id,
                     "meta",
@@ -105,14 +141,8 @@ class LinkWebSocketProxyServer:
                         pass
 
         except Exception as e:
-            await self._link.send_frame(
-                stream_id,
-                "meta",
-                encode_json_bytes(
-                    {"kind": "error", "message": f"{type(e).__name__}: {e}"}
-                ),
-                end=True,
-            )
+            self._logger.error(f"WS proxy: exception stream={stream_id}: {e!r}")
+            await self._send_error(stream_id, f"{type(e).__name__}: {e}")
 
     async def _pump_upstream_to_link(self, stream_id: str, ws) -> None:
         try:
@@ -137,14 +167,7 @@ class LinkWebSocketProxyServer:
                 end=True,
             )
         except Exception as e:
-            await self._link.send_frame(
-                stream_id,
-                "meta",
-                encode_json_bytes(
-                    {"kind": "error", "message": f"{type(e).__name__}: {e}"}
-                ),
-                end=True,
-            )
+            await self._send_error(stream_id, f"{type(e).__name__}: {e}")
 
     async def _pump_link_to_upstream(self, stream_id: str, ws) -> None:
         while True:
@@ -173,3 +196,11 @@ class LinkWebSocketProxyServer:
             if kind == "error":
                 await ws.close(code=1011, reason="remote error")
                 return
+
+    async def _send_error(self, stream_id: str, message: str) -> None:
+        await self._link.send_frame(
+            stream_id,
+            "meta",
+            encode_json_bytes({"kind": "error", "message": message}),
+            end=True,
+        )
