@@ -59,6 +59,7 @@ athnet = "aethernet.cli:run"
 extend-exclude = [
     "tests/",
     "aethernet_link.py",
+    "README.md",
 ]
 
 [tool.ruff.lint]
